@@ -1,0 +1,36 @@
+name: ClockIQ
+description: >-
+  Clock Tree Diagnostics & Optimization Assistant for Synopsys Fusion Compiler
+  CTS reports. Analyzes skew, insertion delay, violation clustering, and generates
+  structured root-cause hypotheses with prioritized fix recommendations.
+version: "1.0"
+author: shivamka
+language: python3
+
+entry_point: clockiq_agent.py
+
+usage:
+  - "python3 clockiq_agent.py --report <path/to/cts.rpt>"
+  - "python3 clockiq_agent.py --report <path/to/cts.log> --output report.md"
+  - "cat cts_report.txt | python3 clockiq_agent.py --stdin"
+
+input:
+  formats: [.rpt, .log, .txt]
+  source: Synopsys Fusion Compiler CTS reports (Cheetah flow)
+
+output:
+  format: Markdown
+  sections:
+    - Critical Issues (High Priority)
+    - Warnings (Medium Priority)
+    - Low Priority / Validation
+    - Healthy Clocks
+    - Observations (System-level Insights)
+    - Summary Statistics
+
+thresholds:
+  skew_ps: 100
+  insertion_delay_ns: 1.0
+  violation_cluster: 10
+
+dependencies: []  # stdlib only – fully offline capable

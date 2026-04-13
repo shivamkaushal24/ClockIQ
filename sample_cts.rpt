@@ -1,0 +1,41 @@
+==============================================================
+  Fusion Compiler CTS Report  (Cheetah Flow - Example)
+==============================================================
+
+Clock: CLK_CORE
+  Max Skew          : 0.215 ns
+  Average Skew      : 0.062 ns
+  Insertion Delay (min / max / avg) : 0.820 / 1.450 / 1.105 ns
+  Latency           : 1.105 ns
+  Buffer Depth      : 12
+  Endpoints (Sinks) : 3840
+  Setup Violations  : 0
+  Hold Violations   : 47
+
+Clock: CLK_MEM
+  Max Skew          : 0.058 ns
+  Insertion Delay (min / max / avg) : 0.410 / 0.960 / 0.685 ns
+  Latency           : 0.685 ns
+  Buffer Depth      : 8
+  Endpoints (Sinks) : 512
+  Setup Violations  : 0
+  Hold Violations   : 0
+
+Clock: CLK_IO
+  Max Skew          : 0.345 ns
+  Average Skew      : 0.210 ns
+  Insertion Delay (min / max / avg) : 1.200 / 2.100 / 1.650 ns
+  Latency           : 1.650 ns
+  Buffer Depth      : 18
+  Endpoints (Sinks) : 128
+  Setup Violations  : 22
+  Hold Violations   : 15
+
+Clock: CLK_SCAN
+  Max Skew          : 0.075 ns
+  Insertion Delay (min / max / avg) : 0.350 / 0.720 / 0.535 ns
+  Latency           : 0.535 ns
+  Buffer Depth      : 7
+  Endpoints (Sinks) : 256
+  Setup Violations  : 0
+  Hold Violations   : 0
