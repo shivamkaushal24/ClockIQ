@@ -1,0 +1,30 @@
+#!/bin/bash
+# clockiq-agent — ClockIQ Clock Tree Diagnostics & Optimization Assistant
+# -------------------------------------------------------------------------
+# Analyzes Synopsys Fusion Compiler CTS reports and generates structured
+# diagnostics, root-cause hypotheses, and prioritized recommendations.
+#
+# Usage:
+#   clockiq-agent <apr_fc_run_area>
+#   clockiq-agent <path/to/cts_report.rpt>
+#   clockiq-agent <path> > report.md
+
+SCRIPT="/nfs/site/home/shivamka/.copilot/skills/clockiq.py"
+PYTHON="/p/hdk/pu_tu/prd/autobots_sdk/2.1.2/venv_autobots/bin/python"
+
+if [[ $# -lt 1 ]]; then
+    echo "ClockIQ — Clock Tree Diagnostics & Optimization Assistant"
+    echo ""
+    echo "Usage:"
+    echo "  clockiq-agent <apr_fc_run_area>"
+    echo "  clockiq-agent <path/to/cts_report.rpt>"
+    echo "  clockiq-agent <path> > report.md"
+    echo ""
+    echo "Examples:"
+    echo "  clockiq-agent /nfs/site/disks/<disk>/<user>/<block>/runs/<step>/apr_fc"
+    echo "  clockiq-agent /path/to/clock_route_opt.rpt"
+    echo "  clockiq-agent /path/to/apr_fc > clockiq_report.md"
+    exit 1
+fi
+
+exec "$PYTHON" "$SCRIPT" "$@"
