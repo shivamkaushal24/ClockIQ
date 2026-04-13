@@ -17,32 +17,32 @@
 | Hold diagnosis | NORMAL_HOLD_FIXING |
 
 > ### ⚠️ 20 WARNINGS REQUIRE ATTENTION
-> **Affected clocks:** `oddccfclk`, `sbclk_right`, `N/A`
-> **Metrics flagged:** CHECK_WIRE_OBJECTS_AT_BOUNDARY, CHECK_NETSPEC_MISSING_SHIELD, CHECK_IO_PLACEMENT, CHECK_NETSPEC_REPEATER_DISTANCE, CTS_VIOLATION, CHECK_PLACEMENT_LEGALITY, CHECK_PDFX_CONTENT, CHECK_PORTS_WITH_MULTI_TERMS, CHECK_NETSPEC_LSPEC, CHECK_PDN_PG_CUTS, CHECK_CLOCK_CELLS_CBC_PLACEMENT, CHECK_HALO_LOCATIONS, SKEW, CHECK_DANGLING_PORTS_PINS, CHECK_SIGNAL_ELEVATOR_XOR, INSERTION_DELAY, CHECK_STD_CELL_POWER_HOOKUP, CHECK_DANGLING_USER_SHAPES, CHECK_PWR_INTEG, CHECK_PDN_POLYGONS
+> **Affected clocks:** `oddccfclk`, `N/A`, `sbclk_right`
+> **Metrics flagged:** CHECK_WIRE_OBJECTS_AT_BOUNDARY, CHECK_PDN_PG_CUTS, CHECK_PDFX_CONTENT, CHECK_PORTS_WITH_MULTI_TERMS, CHECK_NETSPEC_LSPEC, CHECK_DANGLING_USER_SHAPES, INSERTION_DELAY, CHECK_DANGLING_PORTS_PINS, CHECK_CLOCK_CELLS_CBC_PLACEMENT, CHECK_SIGNAL_ELEVATOR_XOR, CHECK_IO_PLACEMENT, CHECK_HALO_LOCATIONS, CTS_VIOLATION, CHECK_PLACEMENT_LEGALITY, CHECK_PWR_INTEG, SKEW, CHECK_PDN_POLYGONS, CHECK_NETSPEC_REPEATER_DISTANCE, CHECK_NETSPEC_MISSING_SHIELD, CHECK_STD_CELL_POWER_HOOKUP
 > These warnings indicate sub-optimal CTS quality. Left unresolved they can become critical after route_opt or ECO.
 
 ## 🔴 Critical Issues (High Priority)
 
-### [SKEW] clock=`sbclk_right`
-### [SKEW] clock=`ctfclk_200`
+### [SKEW] clock=`tapclk_sys`
+### [SKEW] clock=`xtalclk`
 ### [SKEW] clock=`fuse_roclk`
+### [SKEW] clock=`tapclk`
+### [SKEW] clock=`ctfclk_200`
 ### [SKEW] clock=`roclk`
 ### [SKEW] clock=`ctfclk`
-### [SKEW] clock=`tapclk`
-### [SKEW] clock=`xtalclk`
-### [SKEW] clock=`tapclk_sys`
-### [VIOLATIONS] clock=`sbclk_right`
-### [VIOLATIONS] clock=`ctfclk_200`
+### [SKEW] clock=`sbclk_right`
 ### [VIOLATIONS] clock=`oddccf_l2tclk`
-### [VIOLATIONS] clock=`oddccf_t2lclk`
+### [VIOLATIONS] clock=`tapclk_sys`
+### [VIOLATIONS] clock=`xtalclk`
 ### [VIOLATIONS] clock=`fuse_roclk`
+### [VIOLATIONS] clock=`tapclk`
+### [VIOLATIONS] clock=`oddccfclk`
+### [VIOLATIONS] clock=`ctfclk_200`
 ### [VIOLATIONS] clock=`roclk`
 ### [VIOLATIONS] clock=`ctfclk`
-### [VIOLATIONS] clock=`oddccfclk`
-### [VIOLATIONS] clock=`tapclk`
+### [VIOLATIONS] clock=`sbclk_right`
+### [VIOLATIONS] clock=`oddccf_t2lclk`
 ### [VIOLATIONS] clock=`visaclk`
-### [VIOLATIONS] clock=`xtalclk`
-### [VIOLATIONS] clock=`tapclk_sys`
 ### [CHECK_SHORTS] clock=`N/A`
 > check_shorts = 1740 at compile_final_opto
 
@@ -429,7 +429,7 @@ _No fully healthy clocks identified._
 ## 🔍 Observations
 
 - ⚠️  System-wide average skew (408 ps) exceeds target — potential global CTS topology or constraint issue.
-- 🔍 Mixed hold+setup violations on: sbclk_right, ctfclk_200, oddccf_l2tclk. May indicate post-CTS routing detours affecting both timing types.
+- 🔍 Mixed hold+setup violations on: oddccf_l2tclk, tapclk_sys, xtalclk. May indicate post-CTS routing detours affecting both timing types.
 - ℹ️  Total CTS buffer/inverter cells in design: 16,259.
 
 ## 🎓 Fellow-Level Deep-Dive
@@ -488,20 +488,32 @@ optimize_netlist -area; place_opt -effort high
 
 ## 📋 Recommended Actions — High Priority (Critical)
 
-- **Clock:** `sbclk_right`
-  - **Symptom:** Clock 'sbclk_right' max skew = 818 ps (threshold 100 ps).
-  - **Likely Cause:** Localised routing detour or physical placement cluster far from clock trunk causing asymmetric delay on affected sinks.
-  - **Suggested Fix:** Identify outlier sinks via `report_clock_tree -skew`; adjust cell placement or insert local balance buffers near affected region.
+- **Clock:** `tapclk_sys`
+  - **Symptom:** Clock 'tapclk_sys' max skew = 469 ps (threshold 100 ps).
+  - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
+  - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
   - **Confidence:** High
 
-- **Clock:** `ctfclk_200`
-  - **Symptom:** Clock 'ctfclk_200' max skew = 513 ps (threshold 100 ps).
+- **Clock:** `xtalclk`
+  - **Symptom:** Clock 'xtalclk' max skew = 637 ps (threshold 100 ps).
   - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
   - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
   - **Confidence:** High
 
 - **Clock:** `fuse_roclk`
   - **Symptom:** Clock 'fuse_roclk' max skew = 566 ps (threshold 100 ps).
+  - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
+  - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
+  - **Confidence:** High
+
+- **Clock:** `tapclk`
+  - **Symptom:** Clock 'tapclk' max skew = 583 ps (threshold 100 ps).
+  - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
+  - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
+  - **Confidence:** High
+
+- **Clock:** `ctfclk_200`
+  - **Symptom:** Clock 'ctfclk_200' max skew = 513 ps (threshold 100 ps).
   - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
   - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
   - **Confidence:** High
@@ -518,35 +530,11 @@ optimize_netlist -area; place_opt -effort high
   - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
   - **Confidence:** High
 
-- **Clock:** `tapclk`
-  - **Symptom:** Clock 'tapclk' max skew = 583 ps (threshold 100 ps).
-  - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
-  - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
-  - **Confidence:** High
-
-- **Clock:** `xtalclk`
-  - **Symptom:** Clock 'xtalclk' max skew = 637 ps (threshold 100 ps).
-  - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
-  - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
-  - **Confidence:** High
-
-- **Clock:** `tapclk_sys`
-  - **Symptom:** Clock 'tapclk_sys' max skew = 469 ps (threshold 100 ps).
-  - **Likely Cause:** Global CTS topology imbalance or incorrect target latency constraints causing unequal path lengths across the design.
-  - **Suggested Fix:** Re-run CTS with tighter skew targets; review `set_clock_tree_options` skew constraints; verify clock tree reference cells.
-  - **Confidence:** High
-
 - **Clock:** `sbclk_right`
-  - **Symptom:** Clock 'sbclk_right': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
-  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
-  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
-  - **Confidence:** Medium
-
-- **Clock:** `ctfclk_200`
-  - **Symptom:** Clock 'ctfclk_200': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
-  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
-  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
-  - **Confidence:** Medium
+  - **Symptom:** Clock 'sbclk_right' max skew = 818 ps (threshold 100 ps).
+  - **Likely Cause:** Localised routing detour or physical placement cluster far from clock trunk causing asymmetric delay on affected sinks.
+  - **Suggested Fix:** Identify outlier sinks via `report_clock_tree -skew`; adjust cell placement or insert local balance buffers near affected region.
+  - **Confidence:** High
 
 - **Clock:** `oddccf_l2tclk`
   - **Symptom:** Clock 'oddccf_l2tclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
@@ -554,8 +542,14 @@ optimize_netlist -area; place_opt -effort high
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
 
-- **Clock:** `oddccf_t2lclk`
-  - **Symptom:** Clock 'oddccf_t2lclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
+- **Clock:** `tapclk_sys`
+  - **Symptom:** Clock 'tapclk_sys': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
+  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
+  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
+  - **Confidence:** Medium
+
+- **Clock:** `xtalclk`
+  - **Symptom:** Clock 'xtalclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
   - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
@@ -566,44 +560,50 @@ optimize_netlist -area; place_opt -effort high
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
 
-- **Clock:** `roclk`
-  - **Symptom:** Clock 'roclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
-  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
-  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
-  - **Confidence:** Medium
-
-- **Clock:** `ctfclk`
-  - **Symptom:** Clock 'ctfclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
+- **Clock:** `tapclk`
+  - **Symptom:** Clock 'tapclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
   - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
 
 - **Clock:** `oddccfclk`
-  - **Symptom:** Clock 'oddccfclk': 9 setup + 33 hold violations (CLUSTERED). Type: mixed.
+  - **Symptom:** Clock 'oddccfclk': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
   - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
 
-- **Clock:** `tapclk`
-  - **Symptom:** Clock 'tapclk': 9 setup + 33 hold violations (CLUSTERED). Type: mixed.
+- **Clock:** `ctfclk_200`
+  - **Symptom:** Clock 'ctfclk_200': 9 setup + 34 hold violations (CLUSTERED). Type: mixed.
+  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
+  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
+  - **Confidence:** Medium
+
+- **Clock:** `roclk`
+  - **Symptom:** Clock 'roclk': 9 setup + 33 hold violations (CLUSTERED). Type: mixed.
+  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
+  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
+  - **Confidence:** Medium
+
+- **Clock:** `ctfclk`
+  - **Symptom:** Clock 'ctfclk': 9 setup + 33 hold violations (CLUSTERED). Type: mixed.
+  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
+  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
+  - **Confidence:** Medium
+
+- **Clock:** `sbclk_right`
+  - **Symptom:** Clock 'sbclk_right': 8 setup + 33 hold violations (CLUSTERED). Type: mixed.
+  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
+  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
+  - **Confidence:** Medium
+
+- **Clock:** `oddccf_t2lclk`
+  - **Symptom:** Clock 'oddccf_t2lclk': 8 setup + 33 hold violations (CLUSTERED). Type: mixed.
   - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
 
 - **Clock:** `visaclk`
   - **Symptom:** Clock 'visaclk': 8 setup + 33 hold violations (CLUSTERED). Type: mixed.
-  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
-  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
-  - **Confidence:** Medium
-
-- **Clock:** `xtalclk`
-  - **Symptom:** Clock 'xtalclk': 8 setup + 33 hold violations (CLUSTERED). Type: mixed.
-  - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
-  - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
-  - **Confidence:** Medium
-
-- **Clock:** `tapclk_sys`
-  - **Symptom:** Clock 'tapclk_sys': 8 setup + 33 hold violations (CLUSTERED). Type: mixed.
   - **Likely Cause:** Mixed hold + setup violations suggest clock skew imbalance or post-CTS routing detours affecting multiple path types.
   - **Suggested Fix:** Rebalance CTS; run incremental `clock_opt`; check post-route timing with updated parasitics.
   - **Confidence:** Medium
