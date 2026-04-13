@@ -1,0 +1,139 @@
+**Skill Name:** CTS Debug Agent name ClockIQ (Clock Tree Diagnostics & Optimization Assistant)
+
+**Objective:**
+Build a GitHub Copilot skill that analyzes Synopsys Fusion Compiler Clock Tree Synthesis (CTS) reports and generates structured diagnostics, root-cause hypotheses, and prioritized debug recommendations. The system should go beyond simple threshold checks and perform context-aware reasoning similar to an experienced physical design engineer.
+
+---
+
+**Input Specification:**
+- File types: `.rpt`, `.log`, or raw text
+- Source: Synopsys Fusion Compiler CTS reports genrated by cheetah flow, to understand cheetha flow use r2g_agent
+- Input method: ward path OR direct text content passed to the skill
+
+---
+
+**Output Specification:**
+Generate a Markdown-formatted structured report with the following sections:
+
+1. **Critical Issues (High Priority)** – Skew violations, clustered timing failures
+2. **Warnings (Medium Priority)** – Excessive insertion delays, buffering inefficiencies
+3. **Healthy Clocks** – Clocks meeting all targets
+4. **Observations (System-level Insights)** – Patterns across clock domains, potential floorplan or routing issues
+5. **Recommended Actions (Prioritized)** – Specific, actionable fixes ranked by urgency
+
+---
+
+**Functional Requirements:**
+
+### 1. Parsing Layer
+Unserstad the CTS directory structure using r2g_agent once you understand the structure fully Extract the following metrics from Fusion Compiler CTS report or logs text using regex and section markers:
+
+**Clock Metrics:**
+- Clock name
+- Max skew, average skew (if available)
+- Insertion delay (min/max/avg)
+- Latency
+
+**Violations:**
+- Setup violations count
+- Hold violations count
+- Endpoint distribution (if available)
+
+**Structural Indicators (if present):**
+- Buffer depth
+- Tree balance hints
+- Clock branching patterns
+
+**Error Handling:**
+- If sections are missing or malformed, return partial analysis with a clear warning
+- Handle unexpected formats gracefully with informative error messages
+
+---
+
+### 2. Analysis Layer (Pattern-Based Reasoning)
+
+**A. Skew Analysis:**
+- Identify high skew vs target (default threshold: 100ps)
+- Estimate skew distribution variance if data allows
+- Classify: Global skew issue vs Localized skew issue
+
+**B. Insertion Delay Analysis:**
+- Detect excessive delay (default threshold: >1ns)
+- Correlate patterns:
+  - High delay + low skew → likely over-buffering
+  - High delay + high skew → routing/topology issue
+
+**C. Violation Analysis:**
+- Detect violation clustering per clock or path group
+- Classify:
+  - Hold-dominated
+  - Setup-dominated
+  - Mixed
+
+---
+
+### 3. Root Cause Hypothesis Generation
+For each identified issue, generate a structured hypothesis:
+
+- **Symptom:** What the data shows
+- **Likely Cause:** Engineering reasoning (e.g., tree imbalance, routing detour, over-buffering)
+- **Suggested Fix:** Specific action (e.g., rebalance CTS, adjust clustering, insert/remove buffers, floorplan adjustment)
+- **Confidence Level (Optional):** Low/Medium/High based on pattern strength
+
+**Example:**
+
+
+---
+
+### 4. Recommendation Engine
+Generate prioritized action items:
+
+**High Priority (Critical):**
+- Fix skew violations exceeding threshold
+- Address clustered timing failures (>10 violations on single clock)
+
+**Medium Priority:**
+- Optimize insertion delay (reduce over-buffering)
+- Adjust buffering strategy for balanced tree
+
+**Low Priority:**
+- Validate timing constraints
+- Fine-tune uncertainty margins
+
+---
+
+### 5. Output Format
+Produce a clean Markdown report with:
+- Section headers for each priority tier
+- Bulleted lists of issues with hypothesis and fixes
+- Summary statistics (e.g., total clocks analyzed, violation counts)
+- Observations section highlighting system-level trends
+
+---
+
+**Implementation Requirements:**
+- **Language:** Python 3.8+
+- **Parsing:** Use regex and string methods to extract data; handle partial/missing sections
+- **No External Dependencies:** Offline-capable; no API calls or internet access required
+- **Modular Design:** Separate functions for parsing, analysis, hypothesis generation, and report generation
+- **Extensibility:** Allow easy addition of new analysis rules or thresholds
+
+**Example Function Structure:**
+```python
+def parse_cts_report(text: str) -> dict:
+    """Extract clock metrics, violations, and structural data."""
+    pass
+
+def analyze_cts_data(data: dict) -> dict:
+    """Perform pattern-based reasoning and classify issues."""
+    pass
+
+def generate_hypotheses(analysis: dict) -> list:
+    """Create root-cause hypotheses for each issue."""
+    pass
+
+def generate_recommendations(hypotheses: list) -> str:
+    """Produce prioritized Markdown report."""
+    pass
+
+
