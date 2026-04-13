@@ -55,6 +55,442 @@ HOLD_BUF_RATE        = 200    # buffers routed per hour
 STAGE_ORDER = ["compile_final_opto", "clock_route_opt", "route_opt"]
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CTS Warning / Error Knowledge Base  (Fusion Compiler)
+# Source: FC documentation + observed message text from production runs.
+# Used when snps_ka Kerberos auth is unavailable (offline reference).
+# ─────────────────────────────────────────────────────────────────────────────
+CTS_KNOWLEDGE_BASE: dict = {
+    "CTS-007": {
+        "severity":    "WARNING",
+        "category":    "High Delay Pin",
+        "message":     "Pin '{pin}' has a delay that exceeds the CTS high-delay threshold.",
+        "root_cause":  (
+            "A clock-sink or clock-source pin has an insertion delay larger than the "
+            "CTS target (set via `set_clock_tree_options -target_latency`). "
+            "Typically caused by: (a) deeply-embedded flip-flops with long input nets, "
+            "(b) clock-gating cells with large enable delays, or "
+            "(c) unreachable areas forcing long detours."
+        ),
+        "impact":      (
+            "CTS cannot balance this pin against the rest of the clock tree, "
+            "resulting in local skew degradation and potential setup/hold violations "
+            "at sinks downstream of this pin."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "Pin is in a congested or hard-to-reach area",
+                "command":    "report_clock_qor -type latency -clocks {clk} | grep -A5 {pin}",
+                "description": "Identify the exact latency and branch causing the issue"
+            },
+            {
+                "hypothesis": "Insertion delay target too tight",
+                "command":    "set_clock_tree_options -max_insertion_delay {new_limit}ns\ncompile_clock_tree -incremental",
+                "description": "Relax the insertion delay limit for this clock"
+            },
+            {
+                "hypothesis": "Clock buffer needs manual placement guidance",
+                "command":    "set_clock_tree_references -references {buf_list} -clock {clk}",
+                "description": "Provide stronger drive-strength buffers to reduce delay"
+            },
+        ],
+        "related":     ["CTS-072", "CTS-612", "CTS-613"],
+        "severity_score": 2,
+    },
+
+    "CTS-055": {
+        "severity":    "WARNING",
+        "category":    "Don't-Touch Net — No Buffering",
+        "message":     "The net '{net}' will not be buffered because it is a dont_touch net.",
+        "root_cause":  (
+            "A net in the clock tree has a `dont_touch` attribute set on it (via "
+            "`set_dont_touch` or inherited from an HDL `preserve` attribute). "
+            "CTS respects this constraint and skips buffer insertion on this net, "
+            "leaving it unbalanced. Common sources: scan-clock muxes, ICG outputs, "
+            "PLL output nets, and manually routed global clock trunks."
+        ),
+        "impact":      (
+            "The net is excluded from CTS balancing. Any sinks fed exclusively by "
+            "this net will have uncontrolled latency and may contribute to skew. "
+            "The downstream clock path is effectively 'open-loop' with respect to CTS. "
+            "At scale (>50 dont_touch nets), overall tree balance degrades significantly."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "dont_touch set unintentionally on a CTS-relevant net",
+                "command":    "remove_attribute [get_nets {net}] dont_touch\ncompile_clock_tree -incremental",
+                "description": "Remove dont_touch and allow CTS to buffer the net"
+            },
+            {
+                "hypothesis": "Net must remain dont_touch (e.g., pre-routed trunk)",
+                "command":    "set_clock_tree_exceptions -dont_buffer [get_nets {net}]\n# Accept the skew contribution and add clock uncertainty margin:",
+                "description": "Formally exclude from CTS and widen clock uncertainty to cover the skew"
+            },
+            {
+                "hypothesis": "PLL/divider output with intentional dont_touch",
+                "command":    "set_clock_tree_options -clock {clk} -insertion_delay {measured_latency}",
+                "description": "Manually specify the known insertion delay so CTS can balance against it"
+            },
+        ],
+        "related":     ["CTS-997"],
+        "severity_score": 3,   # High — many dont_touch nets directly hurt skew
+    },
+
+    "CTS-072": {
+        "severity":    "WARNING",
+        "category":    "High Delay Pin — Above Threshold",
+        "message":     "Pin '{pin}' delay ({delay}ps) exceeds the high-delay threshold ({threshold}ps).",
+        "root_cause":  (
+            "Similar to CTS-007 but triggered at a stricter threshold. The pin "
+            "delay is above `cts_high_delay_threshold` in the CTS DRC checker. "
+            "Frequently seen on: output pins of clock-gating cells in high-utilization "
+            "regions, or on clock input pins of MBFFs with long enable paths."
+        ),
+        "impact":      (
+            "Reported pin will not be optimally buffered. May cause localised skew "
+            "exceeding the `target_skew` for the affected clock, and setup slack "
+            "degradation at sinks connected to this high-delay branch."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "Clock-gating cell in congested area",
+                "command":    "set_dont_touch [get_cells {cell}] false\nplace_eco_cells -cells {cell} -displacement_bound 50\ncompile_clock_tree -incremental",
+                "description": "Relax placement and allow CTS to move the gating cell"
+            },
+            {
+                "hypothesis": "MBFF with excessive enable path delay",
+                "command":    "set_multibit_options -exclude [get_cells {mbff_cell}]\ncompile_clock_tree -incremental",
+                "description": "Debank the MBFF so individual FF sinks can be independently buffered"
+            },
+        ],
+        "related":     ["CTS-007", "CTS-612"],
+        "severity_score": 2,
+    },
+
+    "CTS-612": {
+        "severity":    "WARNING",
+        "category":    "High Delay Pin — Unfixable",
+        "message":     "Pin '{pin}' has a high delay that CTS cannot reduce further.",
+        "root_cause":  (
+            "CTS has already attempted to minimise the delay on this pin but cannot "
+            "meet the target. Causes include: (a) the pin is inside a dont_touch "
+            "sub-block, (b) there are no legal buffer locations near the pin, or "
+            "(c) the design has a physical blockage preventing clock routing detours."
+        ),
+        "impact":      (
+            "This pin will remain as a CTS outlier. The high delay is locked in and "
+            "will contribute to the clock tree's worst-case latency. "
+            "Downstream timing paths through this pin will have degraded setup slack."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "Physical blockage near the pin",
+                "command":    "report_placement_blockages -within [get_cells {cell}]\n# Remove or shrink blockage, then:",
+                "description": "Identify and remove blockages preventing buffer placement"
+            },
+            {
+                "hypothesis": "Sub-block is dont_touch at cell level",
+                "command":    "set_dont_touch [get_cells {subblock}] false\ncompile_clock_tree -incremental",
+                "description": "Allow CTS to optimise inside the sub-block"
+            },
+        ],
+        "related":     ["CTS-007", "CTS-072", "CTS-613"],
+        "severity_score": 3,
+    },
+
+    "CTS-613": {
+        "severity":    "WARNING",
+        "category":    "High Delay Pin — Constraint Mismatch",
+        "message":     "Pin '{pin}' delay violates the CTS target due to a constraint conflict.",
+        "root_cause":  (
+            "The pin delay exceeds the CTS target but the violation is caused by a "
+            "conflicting constraint (e.g., `set_max_delay -datapath_only` or "
+            "`set_clock_latency` applied to a path that CTS also controls). "
+            "CTS detects the conflict and reports the pin as a DRC violator."
+        ),
+        "impact":      (
+            "The constraint conflict may cause the CTS engine to use a non-optimal "
+            "buffer strategy for this branch, degrading skew and latency balance."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "Conflicting set_clock_latency constraint",
+                "command":    "report_timing -from {pin} -delay_type max | grep latency\nremove_clock_latency {clk}\ncompile_clock_tree -incremental",
+                "description": "Remove conflicting latency override and let CTS compute it"
+            },
+        ],
+        "related":     ["CTS-612"],
+        "severity_score": 2,
+    },
+
+    "CTS-901": {
+        "severity":    "WARNING",
+        "category":    "Skew Group Balancing Failure",
+        "message":     "CTS could not achieve the target skew for skew group '{skew_group}'.",
+        "root_cause":  (
+            "The CTS engine was unable to balance the sinks within a skew group to "
+            "within `target_skew`. Root causes: (a) extreme spread of sinks across "
+            "a floorplan with limited buffer sites, (b) target_skew set too aggressively "
+            "relative to the physical design, (c) too few CTS reference cells available "
+            "in congested regions, or (d) power domain boundaries preventing buffering."
+        ),
+        "impact":      (
+            "The skew group exceeds its balance target. All timing paths within the "
+            "group are affected. For groups with >1000 sinks, this can translate to "
+            "hundreds or thousands of setup/hold violations."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "target_skew too aggressive",
+                "command":    "set_clock_tree_options -target_skew 0.18 -clock {clk}\ncompile_clock_tree -incremental",
+                "description": "Relax skew target — 150–200 ps is typical for 3–5nm"
+            },
+            {
+                "hypothesis": "Buffer sites blocked in a region",
+                "command":    "report_cell_placement_blockages -within {region}\n# Adjust floorplan blockages, then rerun CTS",
+                "description": "Free up sites in the area with high skew"
+            },
+            {
+                "hypothesis": "Too many sinks in single skew group",
+                "command":    "create_skew_group -name {new_group} -objects [get_cells {subset}]\ncompile_clock_tree -incremental",
+                "description": "Split the skew group to allow finer local balancing"
+            },
+        ],
+        "related":     ["CTS-902"],
+        "severity_score": 4,   # High — directly causes timing violations
+    },
+
+    "CTS-902": {
+        "severity":    "WARNING",
+        "category":    "Latency Imbalance — Exceeds Budget",
+        "message":     "Insertion delay difference between clock branches exceeds the allowed budget.",
+        "root_cause":  (
+            "The latency difference between two branches of the same clock tree exceeds "
+            "`max_skew` or the implicit skew budget. Often caused by: (a) very long "
+            "clock routes to distant sinks (pad-limited or edge-of-die), "
+            "(b) post-CTS ECO changes that add latency on one branch, or "
+            "(c) voltage/temperature margin asymmetry between branches (OCV)."
+        ),
+        "impact":      (
+            "Paths crossing between the high-latency and low-latency branches will "
+            "see a large clock skew component. Setup paths from the fast branch to "
+            "the slow branch are at risk; hold paths in the opposite direction are at risk."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "Branch to remote sinks needs extra buffering stage",
+                "command":    "set_clock_tree_options -max_insertion_delay {budget}ns -clock {clk}\ncompile_clock_tree -incremental",
+                "description": "Cap insertion delay budget so CTS adds compensating buffers"
+            },
+            {
+                "hypothesis": "Post-CTS ECO introduced latency delta",
+                "command":    "undo  # revert ECO\n# or:\nset_clock_latency -source -early {delta} [get_clocks {clk}]",
+                "description": "Compensate the ECO-induced latency with a latency annotation"
+            },
+        ],
+        "related":     ["CTS-901"],
+        "severity_score": 3,
+    },
+
+    "CTS-910": {
+        "severity":    "WARNING",
+        "category":    "Clock Tree Level Depth Violation",
+        "message":     "Clock tree level depth for clock '{clk}' exceeds the maximum allowed ({max_level}).",
+        "root_cause":  (
+            "The clock tree has more buffer/inverter levels than the `max_level` setting "
+            "(`set_clock_tree_options -max_level`). Typically caused by: (a) very large "
+            "fanout requiring many distribution levels, (b) extremely tight target_skew "
+            "forcing deep sub-trees, (c) un-matched drive-strength library cells, or "
+            "(d) poor placement leading to many short-wire hops."
+        ),
+        "impact":      (
+            "Excessive levels increase power consumption and can cause transition-time "
+            "DRC violations on deep branches. Each added level also introduces "
+            "additional OCV margin requirements."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "max_level too restrictive",
+                "command":    "set_clock_tree_options -max_level 40 -clock {clk}\ncompile_clock_tree -incremental",
+                "description": "Increase the maximum level limit to allow CTS more freedom"
+            },
+            {
+                "hypothesis": "Need higher drive-strength cells to reduce fan-out levels",
+                "command":    "set_clock_tree_references -references {hd_buf_list} -clock {clk}\ncompile_clock_tree -incremental",
+                "description": "Add high-drive buffers to the CTS reference list"
+            },
+        ],
+        "related":     ["CTS-918"],
+        "severity_score": 2,
+    },
+
+    "CTS-918": {
+        "severity":    "WARNING",
+        "category":    "Clock Net Transition Time DRC",
+        "message":     "Clock net '{net}' has a transition time ({tran}ps) that violates the CTS DRC limit ({limit}ps).",
+        "root_cause":  (
+            "A net in the clock tree has a signal transition time (slew rate) exceeding "
+            "the `cts_max_transition` DRC limit. Caused by: (a) weak drive-strength "
+            "buffer with high fanout, (b) long high-capacitance wire with no buffering, "
+            "(c) dont_touch constraint preventing buffer insertion on a high-cap net."
+        ),
+        "impact":      (
+            "Slow clock edges cause: (a) increased clock-to-Q delay at sink flip-flops "
+            "(hurts setup and hold simultaneously), (b) increased dynamic power in the "
+            "clock distribution network, (c) potential functional failure at corners if "
+            "transition exceeds cell input requirements."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "Weak buffer with high fanout",
+                "command":    "report_clock_qor -type drc_violators -clocks {clk}\n# Then upsize the identified buffer:\nsize_cell [get_cells {buf_cell}] {larger_ref}",
+                "description": "Identify and upsize the weak clock buffer"
+            },
+            {
+                "hypothesis": "Long wire with no intermediate buffer",
+                "command":    "set_clock_tree_options -max_transition 0.1 -clock {clk}\ncompile_clock_tree -incremental",
+                "description": "Lower transition target to force CTS to add buffering"
+            },
+        ],
+        "related":     ["CTS-910"],
+        "severity_score": 3,
+    },
+
+    "CTS-997": {
+        "severity":    "WARNING",
+        "category":    "Pre-Existing Cell Resizing Failure",
+        "message":     "Failed sizing pre-existing cell '{cell}' with CTS reference cell.",
+        "root_cause":  (
+            "CTS attempted to resize a pre-existing clock cell (from a previous "
+            "compile or ECO) to a reference cell from the CTS library, but could not "
+            "find a legal substitution. Causes: (a) the cell type is not in the CTS "
+            "reference list (`set_clock_tree_references`), (b) the cell has "
+            "`dont_touch` or `dont_size` attribute, (c) the cell is inside a read-only "
+            "or hierarchical boundary block, or (d) the cell is a DFX/secure plugin "
+            "that must remain as-is."
+        ),
+        "impact":      (
+            "The cell retains its original drive strength, which may be mismatched "
+            "for the current fanout. This can cause: (a) transition-time DRC on "
+            "downstream nets, (b) latency imbalance in the branch driven by this cell, "
+            "(c) hold/setup violations at sinks driven by the mis-sized cell. "
+            "High occurrence counts (>100) indicate a systematic library or dont_touch issue."
+        ),
+        "fixes": [
+            {
+                "hypothesis": "DFX/secure plugin cells — intentional, safe to waive",
+                "command":    (
+                    "# These cells are typically intentional dont_touch in DFX stacks.\n"
+                    "# Verify by checking cell names for 'dfxsecure', 'ctmi_', 'stap_':\n"
+                    "report_attribute [get_cells {cell}] dont_touch"
+                ),
+                "description": "Confirm the cell is a protected DFX cell — waive if so"
+            },
+            {
+                "hypothesis": "Cell missing from CTS reference list",
+                "command":    (
+                    "set_clock_tree_references -references [list {existing} {missing_ref}] -clock {clk}\n"
+                    "compile_clock_tree -incremental"
+                ),
+                "description": "Add the required reference cell to the CTS reference list"
+            },
+            {
+                "hypothesis": "Cell has dont_touch attribute preventing resize",
+                "command":    (
+                    "remove_attribute [get_cells {cell}] dont_touch\n"
+                    "compile_clock_tree -incremental"
+                ),
+                "description": "Remove dont_touch if safe, then allow CTS to resize"
+            },
+        ],
+        "related":     ["CTS-055"],
+        "severity_score": 2,
+    },
+}
+
+
+def lookup_cts_code(code: str) -> dict:
+    """Return the knowledge-base entry for a CTS message code, or a generic stub."""
+    entry = CTS_KNOWLEDGE_BASE.get(code)
+    if entry:
+        return entry
+    # Generic fallback for unknown codes
+    return {
+        "severity":       "WARNING",
+        "category":       "Clock Tree DRC",
+        "message":        f"CTS violation reported for code {code}.",
+        "root_cause":     (
+            f"Code {code} is not yet in the ClockIQ knowledge base. "
+            "Check Fusion Compiler documentation (`man fc` or the FC Message Guide) "
+            "for the exact message description."
+        ),
+        "impact":         "Potential CTS quality degradation — investigate manually.",
+        "fixes":          [{"hypothesis": "Unknown — consult FC documentation",
+                            "command":    f"# Search FC docs for {code}",
+                            "description": "Look up the code in the Fusion Compiler Message Reference"}],
+        "related":        [],
+        "severity_score": 1,
+    }
+
+
+def format_cts_knowledge_section(cts_violations: list) -> str:
+    """
+    Render a Markdown 'CTS Warning Reference' section for all violations found,
+    enriched with knowledge-base explanations.
+    """
+    if not cts_violations:
+        return ""
+
+    lines = ["## 📖 CTS Warning & Error Reference\n"]
+    lines.append(
+        "> Each CTS DRC code below is explained with root cause, impact, "
+        "and Fusion Compiler fix commands.\n"
+    )
+
+    for v in cts_violations:
+        code    = v.get("code", "CTS-???")
+        count   = v.get("count", 0)
+        fname   = v.get("file", "")
+        samples = v.get("samples", [])
+        kb      = lookup_cts_code(code)
+
+        sev_icon = {"ERROR": "🔴", "WARNING": "🟡"}.get(kb["severity"], "⚪")
+        score    = kb.get("severity_score", 1)
+        priority = {4: "CRITICAL", 3: "HIGH", 2: "MEDIUM", 1: "LOW"}.get(score, "LOW")
+
+        lines.append(f"### {sev_icon} `{code}` — {kb['category']}")
+        lines.append(f"**File:** `{fname}`  |  **Count:** {count}  |  **Priority:** {priority}\n")
+
+        # Show up to 3 sample instances
+        if samples:
+            lines.append("**Sample instances:**")
+            for s in samples[:3]:
+                lines.append(f"- `{s}`")
+            lines.append("")
+
+        lines.append(f"**Message pattern:**  \n> {kb['message']}\n")
+        lines.append(f"**Root Cause:**  \n{kb['root_cause']}\n")
+        lines.append(f"**Impact:**  \n{kb['impact']}\n")
+
+        if kb.get("fixes"):
+            lines.append("**Recommended Fixes:**\n")
+            for i, fix in enumerate(kb["fixes"], 1):
+                lines.append(f"  **Fix {i}:** {fix['description']}")
+                lines.append(f"  _{fix['hypothesis']}_")
+                lines.append("  ```tcl")
+                for cmd_line in fix["command"].splitlines():
+                    lines.append(f"  {cmd_line}")
+                lines.append("  ```")
+                lines.append("")
+
+        if kb.get("related"):
+            lines.append(f"**Related codes:** {', '.join(f'`{c}`' for c in kb['related'])}\n")
+
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1. PARSING LAYER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -585,15 +1021,29 @@ def parse_cts_directory(run_area: Path) -> dict:
     # ── CTS DRC violation files ───────────────────────────────────────────────
     data["_cts_violations"] = []
     for f in files["cts_violations"]:
-        code = re.search(r'CTS-(\d+)', f.name)
-        code_str = f"CTS-{code.group(1)}" if code else "CTS-???"
+        code_m = re.search(r'CTS-(\d+)', f.name)
+        code_str = f"CTS-{code_m.group(1)}" if code_m else "CTS-???"
         try:
-            lines = f.read_text(errors="replace").splitlines()
-            count = len([ln for ln in lines if ln.strip()])
+            raw_lines = f.read_text(errors="replace").splitlines()
+            active    = [ln for ln in raw_lines if ln.strip()]
+            count     = len(active)
             if count > 0:
-                data["_cts_violations"].append(
-                    {"code": code_str, "count": count, "file": f.name}
-                )
+                # Extract up to 5 unique object names from the warning lines
+                samples = []
+                for ln in active[:10]:
+                    # Match quoted net/cell/pin names
+                    m = re.search(r"'([^']+)'", ln)
+                    if m and m.group(1) not in samples:
+                        samples.append(m.group(1))
+                    if len(samples) >= 5:
+                        break
+                data["_cts_violations"].append({
+                    "code":     code_str,
+                    "count":    count,
+                    "file":     f.name,
+                    "samples":  samples,
+                    "first_line": active[0] if active else "",
+                })
         except Exception:
             pass
 
@@ -1734,6 +2184,11 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
         for w in data["warnings"]:
             lines.append(f"- {w}")
         lines.append("")
+
+    # ── 7. CTS Warning & Error Reference (knowledge-base enrichment) ──────────
+    cts_viols = data.get("_cts_violations", [])
+    if cts_viols:
+        lines.append(format_cts_knowledge_section(cts_viols))
 
     lines += ["---", "*ClockIQ — Clock Tree Diagnostics & Optimization Assistant*"]
     return "\n".join(lines)
