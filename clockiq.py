@@ -2085,13 +2085,17 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
     hold_dx  = analysis.get("hold_diagnosis", {})
     vpc      = setup_dx.get("viol_per_clk", "—")
 
+    n_warn = len(analysis['warnings'])
+    n_crit = len(analysis['critical'])
+    warn_icon = "🟡" if n_warn == 0 else ("🔴" if n_warn > 10 else "⚠️")
+
     lines += [
         "## Summary", "",
         "| Metric | Value |",
         "|---|---|",
         f"| Clocks analyzed | {total_c} |",
-        f"| 🔴 Critical issues | {len(analysis['critical'])} |",
-        f"| 🟡 Warnings | {len(analysis['warnings'])} |",
+        f"| 🔴 Critical issues | **{n_crit}** |",
+        f"| {warn_icon} Warnings | **{n_warn}** |",
         f"| 🟢 Healthy clocks | {len(analysis['healthy'])} |",
         f"| Setup violations | {data.get('global_setup_viols', 0):,} |",
         f"| Hold violations | {data.get('global_hold_viols', 0):,} |",
@@ -2100,6 +2104,18 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
         f"| Hold diagnosis | {hold_dx.get('diagnosis', '—')} |",
         "",
     ]
+
+    # ── Warning callout banner ─────────────────────────────────────────────────
+    if n_warn > 0:
+        warn_clocks = list({w["clock"] for w in analysis["warnings"]})
+        warn_metrics = list({w["metric"].upper() for w in analysis["warnings"]})
+        lines += [
+            f"> ### ⚠️ {n_warn} WARNING{'S' if n_warn != 1 else ''} REQUIRE ATTENTION",
+            f"> **Affected clocks:** {', '.join(f'`{c}`' for c in warn_clocks[:8])}{'...' if len(warn_clocks) > 8 else ''}",
+            f"> **Metrics flagged:** {', '.join(warn_metrics)}",
+            f"> These warnings indicate sub-optimal CTS quality. Left unresolved they can become critical after route_opt or ECO.",
+            "",
+        ]
 
     # ── 1. Critical Issues ────────────────────────────────────────────────────
     lines += ["## 🔴 Critical Issues (High Priority)", ""]
@@ -2131,18 +2147,91 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
         lines += ["_No critical issues detected._", ""]
 
     # ── 2. Warnings ───────────────────────────────────────────────────────────
-    lines += ["## 🟡 Warnings (Medium Priority)", ""]
+    lines += ["## ⚠️ Warnings (Action Required)", ""]
     if analysis["warnings"]:
+        # Group by metric for a cleaner overview table first
+        warn_table = {}
         for issue in analysis["warnings"]:
-            detail = issue.get("detail", "")
-            cmds   = issue.get("commands", [])
+            m = issue["metric"].upper()
+            warn_table.setdefault(m, []).append(issue)
+
+        lines += [
+            "### Warning Overview",
+            "",
+            "| # | Metric | Clock | Value | Threshold | Pattern |",
+            "|---|--------|-------|-------|-----------|---------|",
+        ]
+        for idx, issue in enumerate(analysis["warnings"], 1):
+            val  = issue.get("value", "?")
+            val_str = f"{val:.0f} ps" if isinstance(val, (int, float)) else str(val)
+            thr  = issue.get("threshold", "?")
+            thr_str = f"{thr:.0f} ps" if isinstance(thr, (int, float)) else str(thr)
             lines.append(
-                f"- **[{issue['metric'].upper()}]** clock=`{issue['clock']}` "
-                f"| value=`{issue.get('value','?')}` | pattern=`{issue.get('pattern','?')}`"
-                + (f"\n  > {detail}" if detail else "")
+                f"| {idx} | **{issue['metric'].upper()}** | `{issue['clock']}` "
+                f"| `{val_str}` | `{thr_str}` | {issue.get('pattern','—')} |"
             )
+        lines += ["", "---", ""]
+
+        # Full per-warning detail blocks
+        lines.append("### Warning Details")
+        lines.append("")
+        for idx, issue in enumerate(analysis["warnings"], 1):
+            metric  = issue["metric"].upper()
+            clock   = issue["clock"]
+            val     = issue.get("value", "?")
+            thr     = issue.get("threshold", "?")
+            pattern = issue.get("pattern", "—")
+            detail  = issue.get("detail", "")
+            cmds    = issue.get("commands", [])
+            fixes   = issue.get("fixes", [])
+            eco     = issue.get("eco_cost", {})
+
+            val_str = f"{val:.1f} ps" if isinstance(val, (int, float)) else str(val)
+            thr_str = f"{thr:.1f} ps" if isinstance(thr, (int, float)) else str(thr)
+
+            lines.append(f"#### ⚠️ Warning {idx} — [{metric}] `{clock}`")
+            lines += [
+                "",
+                f"| Field | Value |",
+                f"|-------|-------|",
+                f"| Metric | `{metric}` |",
+                f"| Clock | `{clock}` |",
+                f"| Measured value | `{val_str}` |",
+                f"| Threshold | `{thr_str}` |",
+                f"| Pattern | `{pattern}` |",
+                "",
+            ]
+            if detail:
+                lines += [f"> 💡 **Root Cause:** {detail}", ""]
+            if eco:
+                lines += ["**💰 ECO Cost Estimate:**", "", "| Metric | Value |", "|---|---|"]
+                for k, v in eco.items():
+                    lines.append(f"| {k.replace('_',' ').title()} | {v:,} |" if isinstance(v, int) else f"| {k.replace('_',' ').title()} | {v} |")
+                lines.append("")
+            if fixes:
+                lines += ["**Ranked Fixes:**", "", "| # | Hypothesis | Cost | Expected Improvement |", "|---|---|---|---|"]
+                for i, fx in enumerate(fixes, 1):
+                    lines.append(f"| {i} | {fx.get('hypothesis','?')} | {fx.get('eco_cost','?')} | {fx.get('expected_improvement','?')} |")
+                lines.append("")
             if cmds:
-                lines += ["  ```tcl"] + [f"  {c}" for c in cmds] + ["  ```"]
+                lines += [
+                    "**🔧 Suggested FC Commands:**",
+                    "```tcl",
+                ] + cmds + ["```", ""]
+            else:
+                # Provide generic commands based on metric
+                generic = {
+                    "skew":  [f"report_clock_qor -type local_skew -clocks {{{clock}}}",
+                               f"set_clock_tree_options -target_skew 0.18",
+                               "compile_clock_tree -incremental"],
+                    "delay": [f"report_clock_qor -type latency -clocks {{{clock}}}",
+                               "set_clock_tree_options -buffer_relocation true",
+                               "compile_clock_tree -incremental"],
+                }.get(issue["metric"], [f"report_clock_qor -clocks {{{clock}}}"])
+                lines += [
+                    "**🔧 Suggested FC Commands:**",
+                    "```tcl",
+                ] + generic + ["```", ""]
         lines.append("")
     else:
         lines += ["_No warnings detected._", ""]
