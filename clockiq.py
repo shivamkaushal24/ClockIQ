@@ -34,10 +34,23 @@ from typing import Optional
 # ─────────────────────────────────────────────────────────────────────────────
 # Configurable Thresholds
 # ─────────────────────────────────────────────────────────────────────────────
-SKEW_THRESHOLD_PS        = 100     # 100 ps
-INS_DELAY_THRESHOLD_PS   = 1000   # 1 ns
-SKEW_IMBALANCE_RATIO     = 2.0    # flag if max_skew > 2× avg_skew
-CLUSTER_VIOLATION_THRESH = 10     # >10 violations on one clock = clustered
+SKEW_THRESHOLD_PS        = 100    # 100 ps
+INS_DELAY_THRESHOLD_PS   = 1000  # 1 ns
+SKEW_IMBALANCE_RATIO     = 2.0   # flag if max_skew > 2× avg_skew
+CLUSTER_VIOLATION_THRESH = 10    # >10 violations on one clock = clustered
+
+# MBFF / Hold explosion thresholds
+MBFF_HOLD_EXPLOSION_THRESH = 50_000   # >50K hold viols → MBFF clock push
+MODERATE_HOLD_THRESH       = 1_000    # >1K hold viols  → moderate issue
+# Setup clustering
+SYSTEMIC_VIOLS_PER_CLOCK   = 50      # avg viols/clock → systemic CTS issue
+LOCALIZED_VIOLS_PER_CLOCK  = 10      # avg viols/clock → localized
+
+# ECO cost constants (per hold buffer)
+HOLD_BUF_MULTIPLIER  = 2.5    # estimated hold buffers = violations × 2.5
+HOLD_BUF_AREA_UM2    = 1.2    # µm² per hold buffer
+HOLD_BUF_POWER_MW    = 0.005  # mW per hold buffer
+HOLD_BUF_RATE        = 200    # buffers routed per hour
 
 STAGE_ORDER = ["compile_final_opto", "clock_route_opt", "route_opt"]
 
@@ -207,93 +220,210 @@ def parse_cts_report(text: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cheetah/R2G Directory-Based Parser (supplements text parser)
+# Cheetah/R2G Directory-Based Parser  (Fusion Compiler real report layout)
+# ─────────────────────────────────────────────────────────────────────────────
+# Real layout inside apr_fc/:
+#   reports/{stage}/fc.clock_qor.rpt                         ← skew, latency
+#   reports/{stage}/analyze_timing_setup_violations.rpt.setup.txt
+#   reports/{stage}/analyze_timing_hold_violations.rpt.hold.txt
+#   reports/{stage}/fc.design_qor.rpt                        ← DRC counts
+#   Clock_Cell_usage_my.rpt                                  ← clock cell CSV
+#   HC_summary.rpt / HC.rpt                                  ← design checks
+#   cts_high_delay_pins_CTS-*.rpt                            ← CTS DRC flags
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _discover_cheetah_files(run_area: Path) -> dict:
-    """Walk an apr_fc run area and return categorised file lists."""
+# Stages to probe (in flow order)
+_FC_STAGES = ["cts", "compile_final_opto", "route_opt", "finish"]
+
+
+def _discover_fc_files(run_area: Path) -> dict:
+    """Discover real Fusion Compiler report files inside an apr_fc directory."""
     files = {
-        "timing_rpts":    defaultdict(list),
-        "iris_hold":      defaultdict(list),
-        "iris_setup":     defaultdict(list),
-        "cts_violations": [],
-        "cts_dont_touch": None,
-        "hc_summary":     None,
+        "clock_qor":   {},   # stage → Path
+        "setup_viols": {},   # stage → Path
+        "hold_viols":  {},   # stage → Path
+        "design_qor":  {},   # stage → Path
+        "cts_violations":  [],
+        "hc_summary":  None,
         "clock_cell_usage": None,
     }
-    for stage in STAGE_ORDER:
-        stage_dir = run_area / f"ch_reports_{stage}"
-        if stage_dir.exists():
-            for f in sorted(stage_dir.glob("func_max_low_*.rpt")):
-                files["timing_rpts"][stage].append(f)
-        iris_base = run_area / f"iris_report_fc_{stage}"
-        if iris_base.exists():
-            for merge_dir in iris_base.rglob("merge"):
-                for sub in merge_dir.iterdir():
-                    if not sub.is_dir():
-                        continue
-                    for f in sub.glob("*.pteco_endpoints.hold.rpt"):
-                        files["iris_hold"][stage].append(f)
-                    for f in sub.glob("*.pteco_endpoints.setup.rpt"):
-                        files["iris_setup"][stage].append(f)
+    rpt_base = run_area / "reports"
+    for stage in _FC_STAGES:
+        sd = rpt_base / stage
+        if not sd.exists():
+            continue
+        cqor = sd / "fc.clock_qor.rpt"
+        if cqor.exists():
+            files["clock_qor"][stage] = cqor
+        sv = sd / "analyze_timing_setup_violations.rpt.setup.txt"
+        if sv.exists():
+            files["setup_viols"][stage] = sv
+        hv = sd / "analyze_timing_hold_violations.rpt.hold.txt"
+        if hv.exists():
+            files["hold_viols"][stage] = hv
+        dq = sd / "fc.design_qor.rpt"
+        if dq.exists():
+            files["design_qor"][stage] = dq
+
     for f in sorted(run_area.glob("cts_high_delay_pins_CTS-*.rpt")):
         files["cts_violations"].append(f)
-    dt = run_area / "cts_dont_touch_nets_CTS-055.rpt"
-    if dt.exists():
-        files["cts_dont_touch"] = dt
-    hc = run_area / "HC_summary.rpt"
-    if hc.exists():
-        files["hc_summary"] = hc
+
+    for hc_name in ("HC_summary.rpt", "HC.rpt"):
+        hc = run_area / hc_name
+        if hc.exists():
+            files["hc_summary"] = hc
+            break
+
     cc = run_area / "Clock_Cell_usage_my.rpt"
     if cc.exists():
         files["clock_cell_usage"] = cc
+
     return files
 
 
-def _parse_cheetah_timing_report(path: Path) -> dict:
-    clock = re.sub(r'^func_max_low_', '', path.stem)
-    stage = path.parent.name.replace("ch_reports_", "")
-    text  = path.read_text(errors="replace")
-    data  = {"clock": clock, "stage": stage, "violations": [],
-             "ins_delays": [], "worst_slack": None}
-    for block in re.split(r'(?=^\s+Startpoint:)', text, flags=re.MULTILINE):
-        m = re.search(r'slack\s*\(VIOLATED\)\s+([-\d.]+)', block)
-        if not m:
-            continue
-        slack = float(m.group(1))
-        sp_m  = re.search(r'Startpoint:\s+(\S+)', block)
-        ep_m  = re.search(r'Endpoint:\s+(\S+)', block)
-        pg_m  = re.search(r'Path Group:\s+(\S+)', block)
-        mo_m  = re.search(r'Mode:\s+(\S+)', block)
-        data["violations"].append({
-            "slack":      slack,
-            "startpoint": sp_m.group(1) if sp_m else "unknown",
-            "endpoint":   ep_m.group(1) if ep_m else "unknown",
-            "path_group": pg_m.group(1) if pg_m else clock,
-            "mode":       mo_m.group(1) if mo_m else "unknown",
-        })
-    for m in re.finditer(
-        r'clock network delay \(propagated\)\s+([\d.]+)\s+([\d.]+)', text
+def _parse_fc_clock_qor(path: Path) -> dict:
+    """
+    Parse fc.clock_qor.rpt summary table.
+
+    Returns:
+        { clock_name: {"sinks":int, "levels":int, "repeaters":int,
+                       "max_latency_ps":float, "global_skew_ps":float,
+                       "trans_drc":int, "cap_drc":int,
+                       "skew_groups":[{"name":str,"latency_ps":float,"skew_ps":float}]
+                      }
+        }
+    """
+    clocks = {}
+    current_master = None
+
+    try:
+        text = path.read_text(errors="replace")
+    except Exception:
+        return clocks
+
+    # Find the start of the actual summary table (after the Usage block)
+    table_start = text.find("Clock /")
+    if table_start < 0:
+        return clocks
+    text = text[table_start:]
+
+    # Regex for master clock lines  (M attr, cols 7-8 are "--")
+    # Format: <name> M <sinks> <levels> <repeater_cnt> <rep_area> <cell_area> -- -- <trans> <cap> <wire>
+    re_master = re.compile(
+        r'^(\S+)\s+M\s+(\d+)\s+(\d+)\s+(\d+)\s+'
+        r'[\d.]+\s+[\d.]+\s+--\s+--\s+(\d+)\s+(\d+)',
+        re.MULTILINE
+    )
+    # Regex for skew group lines  (D or U attr, cols 4-6 are "--", cols 7-8 have latency/skew)
+    # Values in fc.clock_qor.rpt are reported in picoseconds.
+    re_skwgrp = re.compile(
+        r'^\s+(\S+)\s+[DU]\s+(\d+)\s+--\s+--\s+--\s+--\s+([\d.]+)\s+([\d.]+)',
+        re.MULTILINE
+    )
+    # Also match Generated (G) clocks that have their own Max Latency / Global Skew
+    re_gen = re.compile(
+        r'^\s+(\S+)\s+G\s+\d+\s+\d+\s+\d+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)',
+        re.MULTILINE
+    )
+
+    for m in re_master.finditer(text):
+        name = m.group(1)
+        clocks[name] = {
+            "sinks":          int(m.group(2)),
+            "levels":         int(m.group(3)),
+            "repeaters":      int(m.group(4)),
+            "trans_drc":      int(m.group(5)),
+            "cap_drc":        int(m.group(6)),
+            "max_latency_ps": None,
+            "global_skew_ps": None,
+            "skew_groups":    [],
+        }
+
+    # Associate skew groups and generated clocks with their master clock
+    # (positional — each master's block ends at the next master's start).
+    master_positions = []
+    for m in re_master.finditer(text):
+        master_positions.append((m.start(), m.group(1)))
+    master_positions.append((len(text), None))   # sentinel
+
+    for i, (pos, clk_name) in enumerate(master_positions[:-1]):
+        next_pos = master_positions[i + 1][0]
+        segment  = text[pos:next_pos]
+
+        # D/U skew groups: columns 7-8 are latency and skew (in ps)
+        for sg in re_skwgrp.finditer(segment):
+            lat_ps  = float(sg.group(3))   # already in ps
+            skew_ps = float(sg.group(4))   # already in ps
+            clocks[clk_name]["skew_groups"].append({
+                "name":       sg.group(1),
+                "sinks":      int(sg.group(2)),
+                "latency_ps": lat_ps,
+                "skew_ps":    skew_ps,
+            })
+            c = clocks[clk_name]
+            if c["max_latency_ps"] is None or lat_ps > c["max_latency_ps"]:
+                c["max_latency_ps"] = lat_ps
+            if c["global_skew_ps"] is None or skew_ps > c["global_skew_ps"]:
+                c["global_skew_ps"] = skew_ps
+
+        # G (Generated) clocks that have their own latency/skew reported
+        for gg in re_gen.finditer(segment):
+            lat_ps  = float(gg.group(2))
+            skew_ps = float(gg.group(3))
+            c = clocks[clk_name]
+            if c["max_latency_ps"] is None or lat_ps > c["max_latency_ps"]:
+                c["max_latency_ps"] = lat_ps
+
+    return clocks
+
+
+def _parse_fc_timing_violations(path: Path) -> dict:
+    """
+    Parse analyze_timing_{setup|hold}_violations.rpt.{setup|hold}.txt.
+
+    Returns:
+        {"total": int, "worst_slack_ps": float|None,
+         "categorized": int, "uncategorized": int,
+         "categories": {label: count},
+         "large_clock_skew": int,
+         "inter_clock": int}
+    """
+    result = {
+        "total": 0, "worst_slack_ps": None,
+        "categorized": 0, "uncategorized": 0,
+        "categories": {}, "large_clock_skew": 0, "inter_clock": 0,
+    }
+    try:
+        text = path.read_text(errors="replace")
+    except Exception:
+        return result
+
+    m = re.search(r'Detect\s+(\d+)\s+violating paths', text)
+    if m:
+        result["total"] = int(m.group(1))
+
+    m = re.search(r'Worst:\s*([-\d.]+)', text)
+    if m:
+        result["worst_slack_ps"] = float(m.group(1))   # already in ps
+
+    m = re.search(r'(\d+)\s+violating paths are categorized', text)
+    if m:
+        result["categorized"] = int(m.group(1))
+
+    m = re.search(r'(\d+)\s+violating paths are uncategorized', text)
+    if m:
+        result["uncategorized"] = int(m.group(1))
+
+    # Extract individual categories (S1/H1 … )
+    for cm in re.finditer(
+        r'\*\s+category\s+[SH]\d+:\s+[^(]+\((\w+)\)\s+(\d+)', text
     ):
-        data["ins_delays"].append(float(m.group(2)) * 1000)
-    if data["violations"]:
-        data["worst_slack"] = min(v["slack"] for v in data["violations"]) * 1000
-    return data
+        result["categories"][cm.group(1)] = int(cm.group(2))
 
+    result["large_clock_skew"] = result["categories"].get("LCS", 0)
+    result["inter_clock"]      = result["categories"].get("ICVP", 0)
 
-def _parse_iris_endpoints(paths: list) -> dict:
-    endpoints = []
-    for p in paths:
-        try:
-            lines = p.read_text(errors="replace").splitlines()
-            endpoints += [l.strip() for l in lines if l.strip()]
-        except Exception:
-            pass
-    blocks = defaultdict(int)
-    for ep in endpoints:
-        block = ep.split("/")[0] if "/" in ep else ep
-        blocks[block] += 1
-    return {"total": len(endpoints), "by_block": dict(blocks)}
+    return result
 
 
 def _parse_hc_summary(path: Path) -> dict:
@@ -333,95 +463,371 @@ def _parse_clock_cell_usage(path: Path) -> dict:
 
 def parse_cts_directory(run_area: Path) -> dict:
     """
-    Parse a Cheetah apr_fc run area directory and return a unified data dict
-    compatible with analyze_cts_data().
+    Parse a Fusion Compiler apr_fc run area using the real FC report layout.
+    Returns a data dict compatible with analyze_cts_data().
     """
-    files = _discover_cheetah_files(run_area)
+    files = _discover_fc_files(run_area)
     data  = parse_cts_report("")   # start with empty structure
 
-    for stage in STAGE_ORDER:
-        stage_ins = defaultdict(list)
-        for rpt_path in files["timing_rpts"].get(stage, []):
-            rpt = _parse_cheetah_timing_report(rpt_path)
-            clk = rpt["clock"]
-            c   = data["clocks"].setdefault(clk, {
-                "skew_max_ps": None, "skew_avg_ps": None,
-                "ins_delay_min_ps": None, "ins_delay_max_ps": None,
-                "ins_delay_avg_ps": None, "latency_ps": None,
-                "buffer_depth": None,
-                "setup_violations": 0, "hold_violations": 0,
-                "worst_setup_slack_ps": None, "worst_hold_slack_ps": None,
-                "endpoints": [],
-                "_stage_data": defaultdict(dict),
-            })
-            c.setdefault("_stage_data", defaultdict(dict))[stage] = rpt
-            for v in rpt["violations"]:
-                c["setup_violations"] += 1
-                data["global_setup_viols"] += 1
-                if (c["worst_setup_slack_ps"] is None or
-                        v["slack"] * 1000 < c["worst_setup_slack_ps"]):
-                    c["worst_setup_slack_ps"] = v["slack"] * 1000
-                c["endpoints"].append(v["endpoint"])
-            stage_ins[clk].extend(rpt["ins_delays"])
+    # ── Determine the "best" stage (latest with data) ────────────────────────
+    best_stage = None
+    for stage in reversed(_FC_STAGES):
+        if stage in files["clock_qor"] or stage in files["setup_viols"]:
+            best_stage = stage
+            break
 
-        # Aggregate insertion delays per clock
-        for clk, delays in stage_ins.items():
-            if delays:
-                avg = sum(delays) / len(delays)
-                c   = data["clocks"].get(clk, {})
-                if c.get("ins_delay_avg_ps") is None or avg > c["ins_delay_avg_ps"]:
-                    c["ins_delay_avg_ps"] = avg
-                    c["ins_delay_min_ps"] = min(delays)
-                    c["ins_delay_max_ps"] = max(delays)
+    # ── Parse clock QoR from each available stage ────────────────────────────
+    # Use the last (latest flow stage) available per-clock data.
+    stage_clock_data = {}   # stage → {clock → {...}}
+    for stage in _FC_STAGES:
+        if stage in files["clock_qor"]:
+            stage_clock_data[stage] = _parse_fc_clock_qor(files["clock_qor"][stage])
 
-        # Hold violations from iris reports
-        hold_paths = files["iris_hold"].get(stage, [])
-        if hold_paths:
-            hd = _parse_iris_endpoints(hold_paths)
-            if hd["total"] > 0:
-                # Store in __iris_hold__ pseudo-clock for analysis
-                data["clocks"].setdefault(f"__iris_hold_{stage}__", {
-                    "skew_max_ps": None, "skew_avg_ps": None,
-                    "ins_delay_min_ps": None, "ins_delay_max_ps": None,
-                    "ins_delay_avg_ps": None, "latency_ps": None,
-                    "buffer_depth": None,
-                    "setup_violations": 0, "hold_violations": hd["total"],
-                    "worst_setup_slack_ps": None, "worst_hold_slack_ps": None,
-                    "endpoints": list(hd["by_block"].keys()),
-                    "_iris_hold": hd,
-                    "_stage": stage,
-                })
-                data["global_hold_viols"] += hd["total"]
+    # Merge clock QoR: populate data["clocks"] using latest stage that has data.
+    all_clock_names = set()
+    for d in stage_clock_data.values():
+        all_clock_names.update(d.keys())
 
-    # CTS violation files
+    def _blank_clock():
+        return {
+            "skew_max_ps": None, "skew_avg_ps": None,
+            "ins_delay_min_ps": None, "ins_delay_max_ps": None,
+            "ins_delay_avg_ps": None, "latency_ps": None,
+            "buffer_depth": None,
+            "setup_violations": 0, "hold_violations": 0,
+            "worst_setup_slack_ps": None, "worst_hold_slack_ps": None,
+            "endpoints": [],
+            "_skew_groups": [],
+            "_sinks": 0, "_levels": 0, "_repeaters": 0,
+            "_trans_drc": 0, "_cap_drc": 0,
+            "_stage_clock_data": {},
+        }
+
+    for clk_name in all_clock_names:
+        c = _blank_clock()
+        # Walk stages in order — later stages overwrite earlier
+        for stage in _FC_STAGES:
+            sd = stage_clock_data.get(stage, {})
+            if clk_name not in sd:
+                continue
+            qd = sd[clk_name]
+            c["_stage_clock_data"][stage] = qd
+            c["_skew_groups"]  = qd["skew_groups"]
+            c["_sinks"]        = qd["sinks"]
+            c["_levels"]       = qd["levels"]
+            c["_repeaters"]    = qd["repeaters"]
+            c["_trans_drc"]    = qd["trans_drc"]
+            c["_cap_drc"]      = qd["cap_drc"]
+            if qd["global_skew_ps"] is not None:
+                c["skew_max_ps"] = qd["global_skew_ps"]
+            if qd["max_latency_ps"] is not None:
+                c["latency_ps"]         = qd["max_latency_ps"]
+                c["ins_delay_avg_ps"]   = qd["max_latency_ps"]
+                c["ins_delay_max_ps"]   = qd["max_latency_ps"]
+            c["buffer_depth"] = qd["repeaters"]
+        data["clocks"][clk_name] = c
+
+    # ── Parse timing violations ───────────────────────────────────────────────
+    # For overall totals use the latest stage with violation files.
+    best_setup_stage = best_stage
+    best_hold_stage  = best_stage
+    for stage in reversed(_FC_STAGES):
+        if stage in files["setup_viols"] and best_setup_stage is None:
+            best_setup_stage = stage
+        if stage in files["hold_viols"] and best_hold_stage is None:
+            best_hold_stage = stage
+
+    setup_viol_data = {}
+    hold_viol_data  = {}
+    for stage in _FC_STAGES:
+        if stage in files["setup_viols"]:
+            setup_viol_data[stage] = _parse_fc_timing_violations(files["setup_viols"][stage])
+        if stage in files["hold_viols"]:
+            hold_viol_data[stage]  = _parse_fc_timing_violations(files["hold_viols"][stage])
+
+    # Store per-stage violation summary and pick worst-stage totals
+    data["_setup_by_stage"] = setup_viol_data
+    data["_hold_by_stage"]  = hold_viol_data
+
+    # Use route_opt or last available stage for global totals
+    for stage in reversed(_FC_STAGES):
+        if stage in setup_viol_data:
+            sv = setup_viol_data[stage]
+            data["global_setup_viols"] = sv["total"]
+            data["_worst_setup_slack_ps"] = sv["worst_slack_ps"]
+            data["_setup_lcs"] = sv["large_clock_skew"]
+            break
+
+    for stage in reversed(_FC_STAGES):
+        if stage in hold_viol_data:
+            hv = hold_viol_data[stage]
+            data["global_hold_viols"] = hv["total"]
+            data["_worst_hold_slack_ps"] = hv["worst_slack_ps"]
+            data["_hold_icvp"] = hv["inter_clock"]
+            break
+
+    # Distribute violations across clocks proportionally (best effort)
+    n_clocks = len(data["clocks"])
+    if n_clocks and data["global_setup_viols"]:
+        per_clk_s = data["global_setup_viols"] // n_clocks
+        remainder = data["global_setup_viols"] % n_clocks
+        for i, c in enumerate(data["clocks"].values()):
+            c["setup_violations"] = per_clk_s + (1 if i < remainder else 0)
+            c["worst_setup_slack_ps"] = data.get("_worst_setup_slack_ps")
+
+    if n_clocks and data["global_hold_viols"]:
+        per_clk_h = data["global_hold_viols"] // n_clocks
+        remainder = data["global_hold_viols"] % n_clocks
+        for i, c in enumerate(data["clocks"].values()):
+            c["hold_violations"] = per_clk_h + (1 if i < remainder else 0)
+            c["worst_hold_slack_ps"] = data.get("_worst_hold_slack_ps")
+
+    # ── CTS DRC violation files ───────────────────────────────────────────────
     data["_cts_violations"] = []
     for f in files["cts_violations"]:
         code = re.search(r'CTS-(\d+)', f.name)
         code_str = f"CTS-{code.group(1)}" if code else "CTS-???"
         try:
             lines = f.read_text(errors="replace").splitlines()
-            count = len([l for l in lines if l.strip()])
-            samples = []
-            for l in lines[:3]:
-                nm = re.search(r"(?:net|pin)\s+'([^']+)'", l)
-                if nm:
-                    samples.append(nm.group(1))
+            count = len([ln for ln in lines if ln.strip()])
             if count > 0:
                 data["_cts_violations"].append(
-                    {"code": code_str, "count": count, "file": f.name,
-                     "samples": samples}
+                    {"code": code_str, "count": count, "file": f.name}
                 )
         except Exception:
             pass
 
-    data["_hc_checks"]       = _parse_hc_summary(files["hc_summary"])
+    data["_hc_checks"]        = _parse_hc_summary(files["hc_summary"])
     data["_clock_cell_usage"] = _parse_clock_cell_usage(files["clock_cell_usage"])
     data["_run_area"]         = str(run_area)
+    data["_stage_order"]      = _FC_STAGES
+    data["_best_stage"]       = best_stage
     return data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. ANALYSIS LAYER
+# 2a. SPECIALIST ANALYSIS FUNCTIONS  (used inside analyze_cts_data)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze_hold_explosion(hold_count: int) -> dict:
+    """
+    Detect whether hold violations stem from MBFF clock push.
+    Returns a structured diagnosis with ECO cost estimate.
+    """
+    if hold_count > MBFF_HOLD_EXPLOSION_THRESH:
+        est_bufs   = int(hold_count * HOLD_BUF_MULTIPLIER)
+        area_um2   = int(est_bufs * HOLD_BUF_AREA_UM2)
+        power_mw   = round(est_bufs * HOLD_BUF_POWER_MW, 1)
+        rt_hrs     = max(1, int(est_bufs / HOLD_BUF_RATE))
+        sbit_flops = int(hold_count / 160)
+        net_save   = int(area_um2 - sbit_flops * 2.5)
+        return {
+            "diagnosis":   "MBFF_CLOCK_PUSH_EXPLOSION",
+            "confidence":  "HIGH",
+            "severity":    "critical",
+            "root_cause":  (
+                f"{hold_count:,} hold violations indicates clock path was pushed on "
+                "replicated MBFFs. Pushing clock on MBFF affects all bits → massive "
+                "skew delta → hold violations at all startpoints simultaneously."
+            ),
+            "eco_cost": {
+                "estimated_hold_buffers": est_bufs,
+                "area_um2":              area_um2,
+                "power_mw":              power_mw,
+                "runtime_hours":         rt_hrs,
+            },
+            "recommended_fix": "REVERT clock push + DEBANK affected MBFFs",
+            "commands": [
+                "undo                                              # Revert last clock ECO",
+                "set_multibit_options -exclude [get_cells {mbff_instances}]",
+                "compile_clock_tree -incremental",
+            ],
+            "expected_outcome": (
+                f"Add ~{sbit_flops:,} single-bit flops, avoid {est_bufs:,} hold buffers"
+            ),
+            "net_savings": (
+                f"~{net_save:,} µm² area saved, ~{rt_hrs} hours runtime avoided"
+            ),
+        }
+    elif hold_count > MODERATE_HOLD_THRESH:
+        est_bufs = int(hold_count * 1.8)
+        return {
+            "diagnosis":   "MODERATE_HOLD_ISSUES",
+            "confidence":  "MEDIUM",
+            "severity":    "warning",
+            "root_cause":  (
+                "Likely due to localised clock skew or over-aggressive setup fixing "
+                "pushing data paths too hard, creating hold exposure."
+            ),
+            "recommended_fix": "Targeted hold buffer insertion with `route_opt`",
+            "commands": [
+                "set_route_opt_strategy -hold_fixing true",
+                "route_opt -incremental",
+                "report_timing -path_type full_clock_expanded -slack_lesser_than 0 -max_paths 50",
+            ],
+            "eco_cost": {
+                "estimated_hold_buffers": est_bufs,
+                "runtime_hours":         max(1, int(est_bufs / HOLD_BUF_RATE)),
+            },
+        }
+    else:
+        return {
+            "diagnosis":  "NORMAL_HOLD_FIXING",
+            "confidence": "HIGH",
+            "severity":   "info",
+            "root_cause": "Hold count within normal range for post-CTS stage.",
+        }
+
+
+def analyze_setup_clustering(setup_count: int, clock_count: int) -> dict:
+    """
+    Determine whether setup violations are systemic (CTS-wide) or localised.
+    Returns diagnosis, diagnostic steps, and ranked fix options with expected impact.
+    """
+    if clock_count == 0:
+        return {"diagnosis": "NO_CLOCKS", "confidence": "LOW"}
+
+    viol_per_clk = setup_count / clock_count
+
+    if viol_per_clk > SYSTEMIC_VIOLS_PER_CLOCK:
+        return {
+            "diagnosis":   "SYSTEMIC_CTS_ISSUE",
+            "confidence":  "HIGH",
+            "severity":    "critical",
+            "viol_per_clk": round(viol_per_clk, 1),
+            "root_cause":  (
+                f"Avg {viol_per_clk:.0f} violations/clock → global problem: "
+                "likely skew budget, insertion delay, or floorplan."
+            ),
+            "diagnostic_steps": [
+                "Check max skew per clock (if >150 ps → relax skew target)",
+                "Check avg insertion delay (if >1.5 ns → over-buffering or congestion)",
+                "Check violation distribution per module (if clustered → floorplan issue)",
+            ],
+            "fixes": [
+                {
+                    "hypothesis":           "Skew budget too tight",
+                    "command":              "set_clock_tree_options -target_skew 0.18; compile_clock_tree -incremental",
+                    "eco_cost":             "LOW (re-synthesis only)",
+                    "expected_improvement": "30–50% violation reduction",
+                },
+                {
+                    "hypothesis":           "Over-buffering inflating latency",
+                    "command":              "set_clock_tree_options -buffer_relocation true; compile_clock_tree -incremental",
+                    "eco_cost":             "MEDIUM (~200 buffers removed)",
+                    "expected_improvement": "20–40% violation reduction",
+                },
+                {
+                    "hypothesis":           "Floorplan congestion detour",
+                    "command":              "report_congestion; check_placement -verbose",
+                    "eco_cost":             "HIGH (floorplan change)",
+                    "expected_improvement": "Up to 60% if hotspot resolved",
+                },
+            ],
+        }
+    elif viol_per_clk < LOCALIZED_VIOLS_PER_CLOCK:
+        return {
+            "diagnosis":   "LOCALIZED_VIOLATIONS",
+            "confidence":  "MEDIUM",
+            "severity":    "warning",
+            "viol_per_clk": round(viol_per_clk, 1),
+            "root_cause":  (
+                f"Avg {viol_per_clk:.1f} violations/clock → isolated path issues "
+                "or MBFF-specific problems on a subset of clocks."
+            ),
+            "diagnostic_steps": [
+                "Identify which specific clocks carry violations",
+                "Check if violating endpoints are MBFF outputs",
+                "If MBFF → debank to single-bit; if not → upsize/retime cells",
+            ],
+            "fixes": [
+                {
+                    "hypothesis":           "MBFF endpoint issue",
+                    "command":              "set_multibit_options -exclude [get_cells {violating_mbs}]; compile_clock_tree -incremental",
+                    "eco_cost":             "LOW–MEDIUM",
+                    "expected_improvement": "50–80% for MBFF-specific violations",
+                },
+                {
+                    "hypothesis":           "Critical path logic depth",
+                    "command":              "optimize_netlist -area; place_opt -effort high",
+                    "eco_cost":             "MEDIUM",
+                    "expected_improvement": "20–30% violation reduction",
+                },
+            ],
+        }
+    else:
+        return {
+            "diagnosis":   "MODERATE_SETUP_ISSUES",
+            "confidence":  "MEDIUM",
+            "severity":    "warning",
+            "viol_per_clk": round(viol_per_clk, 1),
+            "root_cause":  (
+                f"Avg {viol_per_clk:.0f} violations/clock — moderate; "
+                "mix of systemic and isolated issues."
+            ),
+            "fixes": [
+                {
+                    "hypothesis":           "Incremental CTS refinement",
+                    "command":              "clock_opt -only_hold_time; route_opt",
+                    "eco_cost":             "LOW",
+                    "expected_improvement": "15–25% violation reduction",
+                },
+            ],
+        }
+
+
+def compare_flow_generations(flow_data: dict) -> dict:
+    """
+    Compare multiple flow generations (e.g. 21a vs 28a vs 32a).
+    flow_data: {label: {"avg_setup": int, "avg_hold": int, "critical": int}}
+    Returns improvement factors and recommended backport actions.
+    """
+    if len(flow_data) < 2:
+        return {}
+
+    generations = sorted(flow_data.keys())
+    comparisons = {}
+
+    for i in range(1, len(generations)):
+        older, newer = generations[i - 1], generations[i]
+        old_s = flow_data[older].get("avg_setup", 1) or 1
+        new_s = flow_data[newer].get("avg_setup", 1) or 1
+        factor = old_s / new_s if new_s > 0 else 1.0
+
+        entry = {
+            "improvement_factor": round(factor, 1),
+            "setup_reduction":    old_s - new_s,
+        }
+        if factor > 2.0:
+            entry["status"] = "SIGNIFICANT_IMPROVEMENT"
+            entry["investigation_needed"] = [
+                f"diff {older}/scripts/cts_options.tcl {newer}/scripts/cts_options.tcl",
+                "Compare MBFF grouping policies (group_size, exclude lists)",
+                "Compare floorplan utilisation and blockage maps",
+                "Compare clock uncertainty / OCV margin settings",
+            ]
+            entry["recommended_action"] = (
+                f"Backport {newer} CTS recipe settings to {older}; "
+                f"expected to reduce violations by ~{factor:.0f}×"
+            )
+        elif factor > 1.2:
+            entry["status"] = "INCREMENTAL_IMPROVEMENT"
+            entry["recommended_action"] = (
+                f"Minor improvements from {older}→{newer}; review skew targets"
+            )
+        else:
+            entry["status"] = "NO_IMPROVEMENT"
+            entry["recommended_action"] = (
+                f"No meaningful improvement {older}→{newer}; investigate regression"
+            )
+
+        comparisons[f"{older}→{newer}"] = entry
+
+    return comparisons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. MAIN ANALYSIS LAYER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_cts_data(data: dict) -> dict:
@@ -444,9 +850,11 @@ def analyze_cts_data(data: dict) -> dict:
         "warnings": [],
         "healthy":  [],
         "observations": [],
-        "skew_summary":  {},
-        "delay_summary": {},
-        "viol_summary":  {},
+        "skew_summary":   {},
+        "delay_summary":  {},
+        "viol_summary":   {},
+        "hold_diagnosis": {},    # NEW: MBFF explosion analysis
+        "setup_cluster":  {},    # NEW: systemic vs localised
     }
 
     clocks = {
@@ -585,8 +993,8 @@ def analyze_cts_data(data: dict) -> dict:
             "threshold": 0,
             "pattern": v["code"],
             "detail": (
-                f"{v['count']} {v['code']} pins in {v['file']}. "
-                f"Samples: {', '.join(v['samples'][:2])}"
+                f"{v['count']} {v['code']} pins in {v['file']}."
+                + (f" Samples: {', '.join(v['samples'][:2])}" if v.get('samples') else "")
             ),
         })
 
@@ -627,14 +1035,58 @@ def analyze_cts_data(data: dict) -> dict:
              or clocks[clk].get("ins_delay_avg_ps") is not None)
     ]
 
+    # ── D. Hold Explosion Analysis (MBFF clock push detection) ───────────────
+    total_hold = data.get("global_hold_viols", 0)
+    hold_dx    = analyze_hold_explosion(total_hold)
+    analysis["hold_diagnosis"] = hold_dx
+    if hold_dx["severity"] == "critical":
+        analysis["critical"].append({
+            "clock":   "ALL (MBFF)",
+            "metric":  "hold_explosion",
+            "value":   total_hold,
+            "threshold": MBFF_HOLD_EXPLOSION_THRESH,
+            "pattern": hold_dx["diagnosis"],
+            "detail":  hold_dx["root_cause"],
+            "eco_cost": hold_dx.get("eco_cost", {}),
+            "fix":     hold_dx.get("recommended_fix", ""),
+            "commands": hold_dx.get("commands", []),
+        })
+    elif hold_dx["severity"] == "warning" and total_hold > 0:
+        analysis["warnings"].append({
+            "clock":   "multiple",
+            "metric":  "hold_violations",
+            "value":   total_hold,
+            "threshold": MODERATE_HOLD_THRESH,
+            "pattern": hold_dx["diagnosis"],
+            "detail":  hold_dx["root_cause"],
+            "commands": hold_dx.get("commands", []),
+        })
+
+    # ── E. Setup Clustering Analysis ─────────────────────────────────────────
+    total_setup  = data.get("global_setup_viols", 0)
+    real_clocks  = {k: v for k, v in data["clocks"].items()
+                    if not k.startswith("__")}
+    setup_dx     = analyze_setup_clustering(total_setup, len(real_clocks))
+    analysis["setup_cluster"] = setup_dx
+    if setup_dx.get("severity") == "critical":
+        analysis["critical"].append({
+            "clock":   "ALL",
+            "metric":  "setup_clustering",
+            "value":   total_setup,
+            "threshold": SYSTEMIC_VIOLS_PER_CLOCK,
+            "pattern": setup_dx["diagnosis"],
+            "detail":  setup_dx["root_cause"],
+            "fixes":   setup_dx.get("fixes", []),
+        })
+
     # ── System-level observations ─────────────────────────────────────────────
     if len(analysis["critical"]) == 0 and len(analysis["warnings"]) == 0:
         analysis["observations"].append(
-            "✅ All clocks appear healthy with no threshold violations."
+            "✅ All clocks appear healthy — no threshold violations detected."
         )
     if global_avg_skew and global_avg_skew > SKEW_THRESHOLD_PS:
         analysis["observations"].append(
-            f"System-wide average skew ({global_avg_skew:.0f} ps) exceeds target — "
+            f"⚠️  System-wide average skew ({global_avg_skew:.0f} ps) exceeds target — "
             "potential global CTS topology or constraint issue."
         )
     over_buf = [
@@ -643,8 +1095,8 @@ def analyze_cts_data(data: dict) -> dict:
     ]
     if len(over_buf) > 2:
         analysis["observations"].append(
-            f"{len(over_buf)} clocks show over-buffering pattern — "
-            "consider reviewing global CTS buffer lib or target latency constraints."
+            f"⚠️  {len(over_buf)} clocks show over-buffering pattern — "
+            "review global CTS buffer lib or reduce target latency constraints."
         )
     mixed_viols = [
         clk for clk, s in analysis["viol_summary"].items()
@@ -652,13 +1104,35 @@ def analyze_cts_data(data: dict) -> dict:
     ]
     if mixed_viols:
         analysis["observations"].append(
-            f"Mixed hold+setup violations on: {', '.join(mixed_viols[:3])}. "
+            f"🔍 Mixed hold+setup violations on: {', '.join(mixed_viols[:3])}. "
             "May indicate post-CTS routing detours affecting both timing types."
+        )
+    # MBFF explosion observation
+    if hold_dx["diagnosis"] == "MBFF_CLOCK_PUSH_EXPLOSION":
+        eco = hold_dx.get("eco_cost", {})
+        analysis["observations"].append(
+            f"🔴 MBFF CLOCK PUSH EXPLOSION detected ({total_hold:,} hold violations). "
+            f"Fixing with buffers would cost ~{eco.get('estimated_hold_buffers',0):,} cells, "
+            f"~{eco.get('area_um2',0):,} µm² area, ~{eco.get('runtime_hours',0)} hrs. "
+            f"STRONGLY RECOMMENDED: revert clock push + debank MBFFs."
+        )
+    # Setup clustering observation
+    vpc = setup_dx.get("viol_per_clk", 0)
+    if vpc > SYSTEMIC_VIOLS_PER_CLOCK:
+        analysis["observations"].append(
+            f"🔴 SYSTEMIC CTS ISSUE: avg {vpc:.0f} violations/clock — "
+            "global skew, over-buffering, or floorplan problem. "
+            "Targeted ECO will not be sufficient — CTS re-synthesis required."
+        )
+    elif vpc > LOCALIZED_VIOLS_PER_CLOCK:
+        analysis["observations"].append(
+            f"🟡 MODERATE setup clustering: avg {vpc:.1f} violations/clock — "
+            "incremental clock_opt likely sufficient."
         )
     cc = data.get("_clock_cell_usage", {})
     if cc.get("total", 0) > 0:
         analysis["observations"].append(
-            f"Total CTS buffer/inverter cells in design: {cc['total']}."
+            f"ℹ️  Total CTS buffer/inverter cells in design: {cc['total']:,}."
         )
 
     return analysis
@@ -880,32 +1354,300 @@ def generate_recommendations(hypotheses: list) -> str:
     return "\n".join(lines)
 
 
+def format_hold_analysis(hold_analysis: dict, flow: dict) -> str:
+    """Format hold explosion analysis into a detailed Markdown section."""
+    label     = flow.get("label", flow.get("block", "unknown"))
+    hold_cnt  = flow.get("hold_violations", 0)
+    diag      = hold_analysis.get("diagnosis", "UNKNOWN")
+    conf      = hold_analysis.get("confidence", "—")
+    cause     = hold_analysis.get("root_cause", "")
+    fix       = hold_analysis.get("recommended_fix", "")
+    cmds      = hold_analysis.get("commands", [])
+    outcome   = hold_analysis.get("expected_outcome", "")
+    savings   = hold_analysis.get("net_savings", "")
+    eco       = hold_analysis.get("eco_cost", {})
+
+    icon = "🔴" if diag == "MBFF_CLOCK_PUSH_EXPLOSION" else ("🟡" if "MODERATE" in diag else "🟢")
+    lines = [
+        f"### {icon} Hold Analysis — `{label}`",
+        "",
+        f"| Field | Detail |",
+        f"|---|---|",
+        f"| Diagnosis | **{diag}** |",
+        f"| Confidence | {conf} |",
+        f"| Hold violations | **{hold_cnt:,}** |",
+        "",
+        f"**Root Cause:** {cause}",
+        "",
+    ]
+
+    if eco:
+        lines += [
+            "#### 💰 ECO Cost Estimate (if fixed with buffers)",
+            "",
+            "| Metric | Estimate |",
+            "|---|---|",
+        ]
+        if "estimated_hold_buffers" in eco:
+            lines.append(f"| Hold buffers needed | {eco['estimated_hold_buffers']:,} |")
+        if "area_um2" in eco:
+            lines.append(f"| Area overhead | {eco['area_um2']:,} µm² |")
+        if "power_mw" in eco:
+            lines.append(f"| Power overhead | {eco['power_mw']} mW |")
+        if "runtime_hours" in eco:
+            lines.append(f"| Estimated runtime | {eco['runtime_hours']} hrs |")
+        lines.append("")
+
+    if fix:
+        lines += [f"**Recommended Fix:** {fix}", ""]
+
+    if cmds:
+        lines += ["**FC Commands:**", "```tcl"]
+        lines += cmds
+        lines += ["```", ""]
+
+    if outcome:
+        lines += [f"**Expected Outcome:** {outcome}", ""]
+    if savings:
+        lines += [f"**Net Savings (vs buffer fix):** {savings}", ""]
+
+    return "\n".join(lines)
+
+
+def format_setup_analysis(setup_analysis: dict, flow: dict) -> str:
+    """Format setup clustering analysis into a detailed Markdown section."""
+    label    = flow.get("label", flow.get("block", "unknown"))
+    setup_c  = flow.get("setup_violations", 0)
+    clk_c    = flow.get("clock_count", 1)
+    diag     = setup_analysis.get("diagnosis", "UNKNOWN")
+    conf     = setup_analysis.get("confidence", "—")
+    cause    = setup_analysis.get("root_cause", "")
+    vpc      = setup_analysis.get("viol_per_clk", round(setup_c / max(clk_c, 1), 1))
+    steps    = setup_analysis.get("diagnostic_steps", [])
+    fixes    = setup_analysis.get("fixes", [])
+
+    icon = "🔴" if "SYSTEMIC" in diag else ("🟡" if "MODERATE" in diag else "🟢")
+    lines = [
+        f"### {icon} Setup Clustering — `{label}`",
+        "",
+        f"| Field | Detail |",
+        f"|---|---|",
+        f"| Diagnosis | **{diag}** |",
+        f"| Confidence | {conf} |",
+        f"| Setup violations | **{setup_c:,}** across {clk_c} clocks |",
+        f"| Avg violations/clock | **{vpc}** |",
+        "",
+        f"**Root Cause:** {cause}",
+        "",
+    ]
+
+    if steps:
+        lines += ["**Diagnostic Steps:**", ""]
+        for i, s in enumerate(steps, 1):
+            lines.append(f"{i}. {s}")
+        lines.append("")
+
+    if fixes:
+        lines += [
+            "**Ranked Fix Options:**",
+            "",
+            "| # | Hypothesis | ECO Cost | Expected Improvement |",
+            "|---|---|---|---|",
+        ]
+        for i, fx in enumerate(fixes, 1):
+            lines.append(
+                f"| {i} | {fx.get('hypothesis','?')} | "
+                f"{fx.get('eco_cost','?')} | {fx.get('expected_improvement','?')} |"
+            )
+        lines.append("")
+        # Show FC commands for each fix
+        lines += ["**FC Commands (ranked):**", ""]
+        for i, fx in enumerate(fixes, 1):
+            cmd = fx.get("command", "")
+            if cmd:
+                lines += [f"*Option {i} — {fx.get('hypothesis','')}:*", "```tcl", cmd, "```", ""]
+
+    return "\n".join(lines)
+
+
+def format_generation_comparison(generation_analysis: dict) -> str:
+    """Format flow generation comparison into a Markdown section."""
+    if not generation_analysis:
+        return ""
+
+    lines = [
+        "### 📈 Flow Generation Comparison",
+        "",
+        "| Transition | Improvement | Setup Reduction | Status |",
+        "|---|---|---|---|",
+    ]
+    for transition, data in generation_analysis.items():
+        factor  = data.get("improvement_factor", 1.0)
+        delta   = data.get("setup_reduction", 0)
+        status  = data.get("status", "—")
+        icon    = "🟢" if factor > 2.0 else ("🟡" if factor > 1.2 else "🔴")
+        lines.append(
+            f"| `{transition}` | **{factor}×** | {delta:,} fewer viols | {icon} {status} |"
+        )
+    lines.append("")
+
+    for transition, data in generation_analysis.items():
+        action  = data.get("recommended_action", "")
+        inv     = data.get("investigation_needed", [])
+        if action:
+            lines += [f"**{transition}:** {action}", ""]
+        if inv:
+            lines += ["  Investigation steps:"]
+            for step in inv:
+                lines.append(f"  - `{step}`")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fellow-Level Multi-Run Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_fellow_level_report(flow_data: list) -> str:
+    """
+    Generate a senior-engineer-quality CTS quality report across multiple runs.
+
+    Args:
+        flow_data: list of dicts, one per run area:
+            {
+              "label":            str,   # e.g. "1p0_32a_cth/par_base_fabric_slice_1"
+              "block":            str,
+              "flow":             str,
+              "hold_violations":  int,
+              "setup_violations": int,
+              "clock_count":      int,
+              "critical":         int,
+            }
+
+    Returns:
+        Markdown report string with hold analysis, setup clustering, and
+        flow generation comparison.
+    """
+    sections = []
+
+    # ── 1. Hold Explosion Analysis ────────────────────────────────────────────
+    hold_sections = []
+    for flow in flow_data:
+        hv = flow.get("hold_violations", 0)
+        if hv > MODERATE_HOLD_THRESH:
+            dx = analyze_hold_explosion(hv)
+            hold_sections.append(format_hold_analysis(dx, flow))
+    if hold_sections:
+        sections.append("## 🔴 Hold Violation Deep-Dive\n")
+        sections.extend(hold_sections)
+    else:
+        sections.append("## 🟢 Hold Violations\n\n_No significant hold violations detected._\n")
+
+    # ── 2. Setup Clustering Analysis ─────────────────────────────────────────
+    setup_sections = []
+    for flow in flow_data:
+        sv  = flow.get("setup_violations", 0)
+        clk = flow.get("clock_count", 1)
+        if sv > 100:
+            dx = analyze_setup_clustering(sv, clk)
+            setup_sections.append(format_setup_analysis(dx, flow))
+    if setup_sections:
+        sections.append("## 🟡 Setup Violation Analysis\n")
+        sections.extend(setup_sections)
+
+    # ── 3. Flow Generation Comparison ────────────────────────────────────────
+    # Group by flow generation label (prefix before first '/')
+    gen_buckets = {}
+    for flow in flow_data:
+        gen  = flow.get("flow", flow.get("label", "unknown").split("/")[0])
+        sv   = flow.get("setup_violations", 0)
+        hv   = flow.get("hold_violations", 0)
+        crit = flow.get("critical", 0)
+        if gen not in gen_buckets:
+            gen_buckets[gen] = {"setups": [], "holds": [], "crits": []}
+        gen_buckets[gen]["setups"].append(sv)
+        gen_buckets[gen]["holds"].append(hv)
+        gen_buckets[gen]["crits"].append(crit)
+
+    gen_summary = {
+        gen: {
+            "avg_setup": int(sum(v["setups"]) / len(v["setups"])),
+            "avg_hold":  int(sum(v["holds"])  / len(v["holds"])),
+            "critical":  int(sum(v["crits"])  / len(v["crits"])),
+        }
+        for gen, v in gen_buckets.items()
+    }
+    gen_cmp = compare_flow_generations(gen_summary)
+    if gen_cmp:
+        sections.append("## 📈 Flow Generation Analysis\n")
+        sections.append(format_generation_comparison(gen_cmp))
+
+    # ── 4. Master Scorecard ───────────────────────────────────────────────────
+    scorecard = [
+        "## 📋 Master Scorecard\n",
+        "| Flow | Block | Clocks | Setup Viols | Hold Viols | 🔴 Critical | Grade |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for flow in sorted(flow_data, key=lambda x: x.get("critical", 0)):
+        sv   = flow.get("setup_violations", 0)
+        hv   = flow.get("hold_violations", 0)
+        crit = flow.get("critical", 0)
+        clk  = flow.get("clock_count", 0)
+        # Simple grade
+        if crit == 0 and sv < 50:
+            grade = "🟢 A"
+        elif crit <= 5 and sv < 200:
+            grade = "🟡 B"
+        elif crit <= 15 and sv < 1000:
+            grade = "🟠 C"
+        else:
+            grade = "🔴 D"
+        scorecard.append(
+            f"| `{flow.get('flow','')}` | `{flow.get('block','')}` | {clk} | "
+            f"{sv:,} | {hv:,} | {crit} | {grade} |"
+        )
+    scorecard.append("")
+    sections.insert(0, "\n".join(scorecard))
+
+    return "\n\n".join(sections)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-Run Full Report
+# ─────────────────────────────────────────────────────────────────────────────
+
 def generate_report(data: dict, analysis: dict, hypotheses: list,
                     source_label: str = "") -> str:
     """
-    Assemble the full ClockIQ Markdown report.
+    Assemble the full ClockIQ Markdown report (single run area).
+    Includes fellow-level hold/setup deep-dive sections.
     """
     clocks  = {k: v for k, v in data["clocks"].items() if not k.startswith("__")}
     total_c = len(clocks)
 
-    lines = [
-        "# 🕐 ClockIQ — Clock Tree Diagnostics Report",
-        "",
-    ]
+    lines = ["# 🕐 ClockIQ — Clock Tree Diagnostics Report", ""]
     if source_label:
         lines += [f"**Source:** `{source_label}`", ""]
 
+    # ── Summary ───────────────────────────────────────────────────────────────
+    setup_dx = analysis.get("setup_cluster", {})
+    hold_dx  = analysis.get("hold_diagnosis", {})
+    vpc      = setup_dx.get("viol_per_clk", "—")
+
     lines += [
-        "## Summary",
-        "",
-        f"| Metric | Value |",
-        f"|---|---|",
+        "## Summary", "",
+        "| Metric | Value |",
+        "|---|---|",
         f"| Clocks analyzed | {total_c} |",
-        f"| Critical issues | {len(analysis['critical'])} |",
-        f"| Warnings        | {len(analysis['warnings'])} |",
-        f"| Healthy clocks  | {len(analysis['healthy'])} |",
-        f"| Global setup violations | {data.get('global_setup_viols', 0)} |",
-        f"| Global hold violations  | {data.get('global_hold_viols', 0)} |",
+        f"| 🔴 Critical issues | {len(analysis['critical'])} |",
+        f"| 🟡 Warnings | {len(analysis['warnings'])} |",
+        f"| 🟢 Healthy clocks | {len(analysis['healthy'])} |",
+        f"| Setup violations | {data.get('global_setup_viols', 0):,} |",
+        f"| Hold violations | {data.get('global_hold_viols', 0):,} |",
+        f"| Avg violations/clock | {vpc} |",
+        f"| Setup diagnosis | {setup_dx.get('diagnosis', '—')} |",
+        f"| Hold diagnosis | {hold_dx.get('diagnosis', '—')} |",
         "",
     ]
 
@@ -913,12 +1655,27 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
     lines += ["## 🔴 Critical Issues (High Priority)", ""]
     if analysis["critical"]:
         for issue in analysis["critical"]:
+            metric = issue["metric"].upper()
             detail = issue.get("detail", "")
-            lines.append(
-                f"- **[{issue['metric'].upper()}]** clock=`{issue['clock']}` "
-                f"value=`{issue.get('value','?')}` pattern=`{issue.get('pattern','?')}`"
-                + (f"\n  > {detail}" if detail else "")
-            )
+            eco    = issue.get("eco_cost", {})
+            cmds   = issue.get("commands", [])
+            fixes  = issue.get("fixes", [])
+
+            lines.append(f"### [{metric}] clock=`{issue['clock']}`")
+            if detail:
+                lines += [f"> {detail}", ""]
+            if eco:
+                lines += ["**💰 ECO Cost Estimate:**", "", "| Metric | Value |", "|---|---|"]
+                for k, v in eco.items():
+                    lines.append(f"| {k.replace('_',' ').title()} | {v:,} |" if isinstance(v, int) else f"| {k.replace('_',' ').title()} | {v} |")
+                lines.append("")
+            if cmds:
+                lines += ["**FC Commands:**", "```tcl"] + cmds + ["```", ""]
+            if fixes:
+                lines += ["**Ranked Fixes:**", "", "| # | Hypothesis | Cost | Expected Improvement |", "|---|---|---|---|"]
+                for i, fx in enumerate(fixes, 1):
+                    lines.append(f"| {i} | {fx.get('hypothesis','?')} | {fx.get('eco_cost','?')} | {fx.get('expected_improvement','?')} |")
+                lines.append("")
         lines.append("")
     else:
         lines += ["_No critical issues detected._", ""]
@@ -928,11 +1685,14 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
     if analysis["warnings"]:
         for issue in analysis["warnings"]:
             detail = issue.get("detail", "")
+            cmds   = issue.get("commands", [])
             lines.append(
                 f"- **[{issue['metric'].upper()}]** clock=`{issue['clock']}` "
-                f"value=`{issue.get('value','?')}` pattern=`{issue.get('pattern','?')}`"
+                f"| value=`{issue.get('value','?')}` | pattern=`{issue.get('pattern','?')}`"
                 + (f"\n  > {detail}" if detail else "")
             )
+            if cmds:
+                lines += ["  ```tcl"] + [f"  {c}" for c in cmds] + ["  ```"]
         lines.append("")
     else:
         lines += ["_No warnings detected._", ""]
@@ -941,40 +1701,41 @@ def generate_report(data: dict, analysis: dict, hypotheses: list,
     lines += ["## 🟢 Healthy Clocks", ""]
     if analysis["healthy"]:
         for clk in analysis["healthy"]:
-            c    = clocks.get(clk, {})
-            skew = c.get("skew_max_ps")
-            dly  = c.get("ins_delay_avg_ps")
-            lines.append(
-                f"- `{clk}` — skew: {f'{skew:.0f} ps' if skew else '—'}, "
-                f"ins_delay: {f'{dly:.0f} ps' if dly else '—'}"
-            )
+            c = clocks.get(clk, {})
+            skew, dly = c.get("skew_max_ps"), c.get("ins_delay_avg_ps")
+            lines.append(f"- `{clk}` — skew: {f'{skew:.0f} ps' if skew else '—'}, ins_delay: {f'{dly:.0f} ps' if dly else '—'}")
         lines.append("")
     else:
-        lines += ["_No fully healthy clocks identified (or no skew data available)._", ""]
+        lines += ["_No fully healthy clocks identified._", ""]
 
     # ── 4. Observations ───────────────────────────────────────────────────────
-    lines += ["## 🔍 Observations (System-level Insights)", ""]
-    if analysis["observations"]:
-        for obs in analysis["observations"]:
-            lines.append(f"- {obs}")
-        lines.append("")
-    else:
-        lines += ["_No system-level observations._", ""]
+    lines += ["## 🔍 Observations", ""]
+    for obs in analysis.get("observations", []) or ["_No system-level observations._"]:
+        lines.append(f"- {obs}")
+    lines.append("")
 
-    # ── 5. Recommended Actions ────────────────────────────────────────────────
+    # ── 5. Fellow-Level Deep-Dive ─────────────────────────────────────────────
+    flow_entry = {
+        "label":            source_label,
+        "block":            source_label.split("/")[-1] if "/" in source_label else source_label,
+        "flow":             source_label.split("/")[0]  if "/" in source_label else source_label,
+        "hold_violations":  data.get("global_hold_viols", 0),
+        "setup_violations": data.get("global_setup_viols", 0),
+        "clock_count":      total_c,
+        "critical":         len(analysis["critical"]),
+    }
+    lines += ["## 🎓 Fellow-Level Deep-Dive", "", generate_fellow_level_report([flow_entry]), ""]
+
+    # ── 6. Recommended Actions ────────────────────────────────────────────────
     lines.append(generate_recommendations(hypotheses))
 
-    # ── Parse warnings ────────────────────────────────────────────────────────
     if data.get("warnings"):
         lines += ["## ⚠️ Parse Warnings", ""]
         for w in data["warnings"]:
             lines.append(f"- {w}")
         lines.append("")
 
-    lines += [
-        "---",
-        "*ClockIQ — Clock Tree Diagnostics & Optimization Assistant*",
-    ]
+    lines += ["---", "*ClockIQ — Clock Tree Diagnostics & Optimization Assistant*"]
     return "\n".join(lines)
 
 
